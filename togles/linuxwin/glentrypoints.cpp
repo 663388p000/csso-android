@@ -42,6 +42,7 @@
 #include "inputsystem/ButtonCode.h"
 #include "tier1.h"
 #include "tier2/tier2.h"
+#include "astc_texcompress.h"		// added: ASTC extension detection (ASTC_InitCaps)
 
 #if defined(_LINUX) && !defined(__ANDROID__)
 #include <GL/glx.h>
@@ -394,6 +395,10 @@ COpenGLEntryPoints::COpenGLEntryPoints()
 		m_nOpenGLVersionMajor, m_nOpenGLVersionMinor, m_nOpenGLVersionPatch );
 
 	Msg("GL_EXTENSIONS=\"%s\"\n", m_pGLDriverStrings[cGLExtensionsString]);
+
+	// Detect GL_KHR_texture_compression_astc_ldr / _hdr / _sliced_3d and
+	// GL_OES_texture_compression_astc from the extension string we just cached.
+	ASTC_InitCaps( m_pGLDriverStrings[cGLExtensionsString] );
 
 	// !!! FIXME: Alfred says the original GL_APPLE_fence code only exists to
 	// !!! FIXME:  hint Apple's drivers and not because we rely on the
