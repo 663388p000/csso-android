@@ -33,8 +33,6 @@ extern "C" {
 }
 
 #include "tier0/icommandline.h"
-#include "tier0/dbg.h"				// Warning() for the ASTC notices
-#include <string.h>
 #include "glmtexinlines.h"
 #include "astc_texcompress.h"		// added: ASTC LDR/HDR runtime recompression for ARGB/RGBA formats
 
@@ -57,19 +55,6 @@ ConVar gl_pow2_tempmem( "gl_pow2_tempmem", "0", FCVAR_INTERNAL_USE,
                         "May help with fragmentation on certain systems caused by heavy churn of large allocations." );
 
 #define TEXSPACE_LOGGING 0
-
-// ---------------------------------------------------------------------------
-// ASTC per-texture state.
-// Whether a texture is stored as ASTC is decided ONCE, on its first
-// WriteTexels(), and applies to every mip / face of that texture (mixing
-// compressed and uncompressed levels in one texture is not legal GL).
-// The decision is kept in two spare high bits of slice 0's m_sliceFlags
-// (the engine only ever sets/clears its own low bits on that byte).
-//   kTexASTCOn  : this texture lives in ASTC (2D, cube or 3D)
-//   kTexASTCOff : this texture stays on the original upload path
-// ---------------------------------------------------------------------------
-static const unsigned char kTexASTCOn  = 0x40;
-static const unsigned char kTexASTCOff = 0x80;
 
 // encoding layout to an index where the bits read
 //	4	:	1 if compressed
@@ -1171,20 +1156,7 @@ GLubyte *CGLMTex::ReadTexels( GLMTexLockDesc *desc, bool readWholeSlice, bool re
 		GLMTexFormatDesc *format = m_layout->m_format;
 		GLenum target = m_layout->m_key.m_texGLTarget;
 
-		if( readOnly && ( m_sliceFlags[ 0 ] & kTexASTCOn ) )
-		{
-			// The GPU copy is ASTC; it cannot be read back into the original
-			// uncompressed layout. Hand back zeroes instead of GL errors.
-			static bool s_bWarnedReadback = false;
-			if ( !s_bWarnedReadback )
-			{
-				s_bWarnedReadback = true;
-				Warning( "ASTC: read-only lock/readback of an ASTC-compressed texture ('%s') returns zeroes.\n", m_debugLabel ? m_debugLabel : "-" );
-			}
-			data = (GLubyte*)(m_backing + m_layout->m_slices[ desc->m_sliceIndex ].m_storageOffset);
-			memset( data, 0, m_layout->m_slices[ desc->m_sliceIndex ].m_storageSize );
-		}
-		else if( readOnly )
+		if( readOnly )
 		{
 			data = (GLubyte*)(m_backing + m_layout->m_slices[ desc->m_sliceIndex ].m_storageOffset);	// this would change for PBO
 			//int sliceSize = m_layout->m_slices[ desc->m_sliceIndex ].m_storageSize;
@@ -3492,11 +3464,9 @@ GLvoid *uncompressDXTc(GLsizei width, GLsizei height, GLenum format, GLsizei ima
     return pixels;
 }
 
-// bASTC == false : original behaviour (software DXT decode -> uncompressed glTexImage2D)
-// bASTC == true  : DXT decode -> RGBA8 -> ASTC LDR -> glCompressedTexImage2D
-static void CompressedTexImage2D_Impl(GLenum target, GLint level, GLenum internalformat,
-							GLsizei width, GLsizei height, GLint border,
-							GLsizei imageSize, const GLvoid *data, bool bASTC)
+void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
+                            GLsizei width, GLsizei height, GLint border,
+                            GLsizei imageSize, const GLvoid *data) 
 {
 	if (internalformat==GL_RGBA8)
 		internalformat = GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
@@ -3531,8 +3501,14 @@ static void CompressedTexImage2D_Impl(GLenum target, GLint level, GLenum interna
 			intformat = hasAlpha ? GL_SRGB8_ALPHA8 : GL_SRGB8;
 	}
 
-	// DXT is always 8-bit normalized colour, so ASTC here is always LDR.
-	if ( bASTC && pixels && data )
+	// Mandatory: DXT bytes are never pushed to the GPU anymore, not even when
+	// the driver natively supports GL_EXT_texture_compression_dxt1 -- this
+	// function is now called unconditionally for every DXT1/3/5 texture (see
+	// the WriteTexels call site), with no native-DXT-upload branch left.
+	// uncompressDXTc() above already decoded the source to RGB(A); re-encode
+	// those pixels as ASTC here instead of uploading them raw. DXT1/3/5 is
+	// always 8-bit normalized color, so this is always LDR, never HDR.
+	if ( pixels && data )
 	{
 		const void *rgbaSrc = pixels;
 		uint8_t *paddedRGBA = NULL;
@@ -3554,19 +3530,9 @@ static void CompressedTexImage2D_Impl(GLenum target, GLint level, GLenum interna
 			rgbaSrc = paddedRGBA;
 		}
 
-		ASTCSource astcSrc;
-		astcSrc.m_pData = rgbaSrc;
-		astcSrc.m_width = width;
-		astcSrc.m_height = height;
-		astcSrc.m_depth = 1;
-		astcSrc.m_glFormat = GL_RGBA;
-		astcSrc.m_glType = GL_UNSIGNED_BYTE;
-		astcSrc.m_bHDR = false;
-		astcSrc.m_bSRGB = srgb;
-		astcSrc.m_bForceOpaque = false;
-
 		ASTCEncodeResult astcResult = {};
-		ASTC_EncodeRequired( astcSrc, &astcResult );
+		ASTC_CompressTextureRequired( /*isHDR=*/false, srgb, /*forceOpaque=*/!hasAlpha, rgbaSrc, width, height,
+									   GL_RGBA, GL_UNSIGNED_BYTE, &astcResult );
 
 		gGL->glCompressedTexImage2D( target, level, (GLenum)astcResult.m_glInternalFormat,
 									  width, height, border,
@@ -3575,24 +3541,13 @@ static void CompressedTexImage2D_Impl(GLenum target, GLint level, GLenum interna
 
 		if ( paddedRGBA )
 			free( paddedRGBA );
-		// uncompressDXTc() hands back `data` itself when the stream was already
-		// uncompressed -- that memory belongs to the caller.
-		if ( pixels != data )
-			free( pixels );
+		free( pixels );
 		return;
 	}
 
 	gGL->glTexImage2D(target, level, intformat, width, height, border, format, type, pixels);
 	if( data != pixels )
 		free(pixels);
-}
-
-// Original entry point (also called from glmgr.cpp CleanupTex with data == NULL).
-void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
-							GLsizei width, GLsizei height, GLint border,
-							GLsizei imageSize, const GLvoid *data)
-{
-	CompressedTexImage2D_Impl( target, level, internalformat, width, height, border, imageSize, data, false );
 }
 
 // TexSubImage should work properly on every driver stack and GPU--enabling by default.
@@ -3685,98 +3640,6 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 		Assert( m_layout->m_format->m_glDataFormat != GL_ALPHA );
 	}
 	
-	// ------------------------------------------------------------------
-	// ASTC: texture-wide decision (see kTexASTCOn / kTexASTCOff above).
-	//
-	// A texture goes ASTC only if its FIRST write carries real, whole-region
-	// data. That deliberately leaves out textures that are created blank and
-	// patched later with sub-rectangle locks (lightmap pages, UI atlases,
-	// procedural textures): ASTC blocks cannot be updated piecemeal from a
-	// raw CPU copy, and glTexSubImage2D on a compressed level is a GL error.
-	// Render targets, MSAA and D3DUSAGE_DYNAMIC (PBO-mapped) textures are
-	// excluded for the same kind of reason.
-	// ------------------------------------------------------------------
-	static_assert( ( ( kSliceValid | kSliceStorageValid | kSliceLocked | kSliceFullyDirty ) & ( kTexASTCOn | kTexASTCOff ) ) == 0,
-				   "ASTC state bits collide with the CGLMTex slice flag bits -- pick other free bits" );
-
-	bool bASTC = false;
-	bool bASTCSkipWrite = false;
-	{
-		unsigned char *pTexFlags = &m_sliceFlags[ 0 ];
-
-		if ( !( *pTexFlags & ( kTexASTCOn | kTexASTCOff ) ) )
-		{
-			const GLMRegion &rq = desc->m_req.m_region;
-			const bool bFullRegion = ( rq.xmin <= 0 && rq.ymin <= 0 && rq.zmin <= 0
-									&& rq.xmax >= slice->m_xSize && rq.ymax >= slice->m_ySize && rq.zmax >= slice->m_zSize );
-
-			bool bOK = ( sliceAddress != NULL ) && !noDataWrite && bFullRegion
-					&& !( m_layout->m_key.m_texFlags & ( kGLMTexMultisampled | kGLMTexRenderable | kGLMTexDynamic ) );
-
-			if ( bOK )
-			{
-				bool bWanted = false, bHDR = false;
-
-				if ( format->m_chunkSize != 1 )
-				{
-					// DXT1/3/5 -> decode -> ASTC LDR. (DXT volumes keep the native path.)
-					bWanted = ( target != GL_TEXTURE_3D );
-				}
-				else if ( ASTC_IsEligibleFormat( (int)m_layout->m_key.m_texFormat ) )
-				{
-					bWanted = true;
-					bHDR = ASTC_IsHDRFormat( (int)m_layout->m_key.m_texFormat );
-				}
-
-				if ( bWanted && !ASTC_CanCompress( bHDR, target == GL_TEXTURE_3D ) )
-				{
-					static bool s_bWarnedNoASTC = false;
-					if ( !s_bWarnedNoASTC )
-					{
-						s_bWarnedNoASTC = true;
-						Warning( "ASTC: this GPU/driver (or build) cannot do %s%s ASTC -- such textures stay uncompressed. "
-								 "Needs GL_KHR_texture_compression_astc_ldr/_hdr%s or GL_OES_texture_compression_astc, and a build with HAVE_ASTCENC.\n",
-								 bHDR ? "HDR" : "LDR", ( target == GL_TEXTURE_3D ) ? " 3D" : "",
-								 ( target == GL_TEXTURE_3D ) ? " + _sliced_3d" : "" );
-					}
-					bWanted = false;
-				}
-				bOK = bWanted;
-			}
-
-			*pTexFlags |= bOK ? kTexASTCOn : kTexASTCOff;
-		}
-
-		bASTC = ( *pTexFlags & kTexASTCOn ) != 0;
-	}
-
-	if ( bASTC )
-	{
-		// Never glTexSubImage2D into a compressed level.
-		mayUseSubImage = false;
-
-		const GLMRegion &rq = desc->m_req.m_region;
-		const bool bFullRegion = ( rq.xmin <= 0 && rq.ymin <= 0 && rq.zmin <= 0
-								&& rq.xmax >= slice->m_xSize && rq.ymax >= slice->m_ySize && rq.zmax >= slice->m_zSize );
-
-		// 3D and cube textures keep their CPU backing for life (see Unlock), so
-		// the whole slice is always valid there and a partial write simply
-		// re-encodes the whole slice. Plain 2D drops the backing after Unlock, so
-		// only the touched rectangle is valid: that cannot be re-encoded.
-		if ( sliceAddress == NULL || noDataWrite
-			|| ( target == GL_TEXTURE_2D && !writeWholeSlice && !bFullRegion ) )
-		{
-			static bool s_bWarnedPartial = false;
-			if ( !s_bWarnedPartial && sliceAddress != NULL )
-			{
-				s_bWarnedPartial = true;
-				Warning( "ASTC: partial update of an already-compressed 2D texture ('%s') ignored -- "
-						 "ASTC blocks can't be patched from a partial CPU copy.\n", m_debugLabel ? m_debugLabel : "-" );
-			}
-			bASTCSkipWrite = true;
-		}
-	}
-
 	// adjust min and max mip written
 	if (desc->m_req.m_mip > m_maxActiveMip)
 	{
@@ -3835,7 +3698,6 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 	// If this extension isn't supported, we just end up with two copies of the texture, one in the GL and one in app memory.
 	//  So it's safe to just go on as if this extension existed and hold the possibly-unnecessary extra RAM.
 
-	if ( !bASTCSkipWrite )
 	switch( target )
 	{
 		case GL_TEXTURE_CUBE_MAP:
@@ -3850,20 +3712,11 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 				Assert( writeWholeSlice );	//subimage not implemented in this path yet
 				// compressed path
 				// http://www.opengl.org/sdk/docs/man/xhtml/glCompressedTexImage2D.xml
-				if ( bASTC )
-				{
-					// DXT bytes never reach the GPU: decode to RGBA, re-encode as ASTC LDR.
-					CompressedTexImage2D_Impl( target, desc->m_req.m_mip, intformat, slice->m_xSize, slice->m_ySize, 0, slice->m_storageSize, sliceAddress, true );
-				}
-				else if ( gGL->m_bHave_GL_EXT_texture_compression_dxt1 )
-				{
-					// ASTC not possible for this texture/GPU: original native DXT upload.
-					gGL->glCompressedTexImage2D( target, desc->m_req.m_mip, intformat, slice->m_xSize, slice->m_ySize, 0, slice->m_storageSize, sliceAddress );
-				}
-				else
-				{
-					CompressedTexImage2D( target, desc->m_req.m_mip, intformat, slice->m_xSize, slice->m_ySize, 0, slice->m_storageSize, sliceAddress );
-				}
+				// DXT bytes are never pushed to the GPU anymore -- decode to RGBA
+				// and re-encode as ASTC unconditionally, even when the driver
+				// natively supports GL_EXT_texture_compression_dxt1 (see
+				// CompressedTexImage2D() below).
+				CompressedTexImage2D( target, desc->m_req.m_mip, intformat, slice->m_xSize, slice->m_ySize, 0, slice->m_storageSize, sliceAddress );
 			}
 			else
 			{
@@ -3912,27 +3765,32 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 				}
 				else
 				{					
-					// ASTC (LDR or HDR, picked from the source D3DFORMAT) for every texture that
-					// was classified kTexASTCOn above. Zero-copy for 8-bit RGBA/BGRA and F16/F32 RGBA.
+					// Mandatory ASTC recompression: every ARGB/RGBA-family upload is
+					// pushed to the GPU as ASTC (LDR or HDR, chosen automatically from
+					// the source D3DFORMAT). Applies to whole-slice, non-render-target,
+					// non-multisampled uploads that actually carry data; render targets
+					// can't be compressed formats on any GPU (nothing can render into an
+					// ASTC block), and MSAA textures are a render target by definition,
+					// so both stay on the uncompressed path below -- everything else
+					// MUST go through ASTC_CompressTextureRequired(), which has no
+					// "fall back to uncompressed" outcome.
 					// http://www.opengl.org/documentation/specs/man_pages/hardcopy/GL/html/gl/teximage2d.html
 
-					if ( bASTC )
-					{
-						const int d3dFmt = (int)m_layout->m_key.m_texFormat;
+					bool bMustASTC = writeWholeSlice
+						&& !noDataWrite
+						&& sliceAddress != NULL
+						&& !(m_layout->m_key.m_texFlags & (kGLMTexMultisampled|kGLMTexRenderable))
+						&& ASTC_IsEligibleFormat( (int)m_layout->m_key.m_texFormat );
 
-						ASTCSource astcSrc;
-						astcSrc.m_pData = sliceAddress;
-						astcSrc.m_width = slice->m_xSize;
-						astcSrc.m_height = slice->m_ySize;
-						astcSrc.m_depth = 1;
-						astcSrc.m_glFormat = glDataFormat;
-						astcSrc.m_glType = glDataType;
-						astcSrc.m_bHDR = ASTC_IsHDRFormat( d3dFmt );
-						astcSrc.m_bSRGB = ( format->m_glIntFormatSRGB != format->m_glIntFormat ) && ( intformat == format->m_glIntFormatSRGB );
-						astcSrc.m_bForceOpaque = ASTC_IsOpaqueFormat( d3dFmt );
+					if ( bMustASTC )
+					{
+						bool isHDR = ASTC_IsHDRFormat( (int)m_layout->m_key.m_texFormat );
+						bool isSRGB = ( format->m_glIntFormatSRGB != format->m_glIntFormat ) && ( intformat == format->m_glIntFormatSRGB );
+						bool forceOpaque = !ASTC_FormatHasAlpha( (int)m_layout->m_key.m_texFormat );
 
 						ASTCEncodeResult astcResult = {};
-						ASTC_EncodeRequired( astcSrc, &astcResult );
+						ASTC_CompressTextureRequired( isHDR, isSRGB, forceOpaque, sliceAddress, slice->m_xSize, slice->m_ySize,
+													   glDataFormat, glDataType, &astcResult );
 
 						// http://www.opengl.org/sdk/docs/man/xhtml/glCompressedTexImage2D.xml
 						gGL->glCompressedTexImage2D( target, desc->m_req.m_mip,
@@ -3988,38 +3846,6 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 										0,							// border
 										slice->m_storageSize,		// imageSize
 										sliceAddress );				// data
-			}
-			else if ( bASTC )
-			{
-				// Sliced-3D ASTC: 2D blocks, one block layer per depth slice
-				// (GL_KHR_texture_compression_astc_sliced_3d / GL_OES_texture_compression_astc).
-				const int d3dFmt = (int)m_layout->m_key.m_texFormat;
-
-				ASTCSource astcSrc;
-				astcSrc.m_pData = sliceAddress;
-				astcSrc.m_width = slice->m_xSize;
-				astcSrc.m_height = slice->m_ySize;
-				astcSrc.m_depth = slice->m_zSize;
-				astcSrc.m_glFormat = glDataFormat;
-				astcSrc.m_glType = glDataType;
-				astcSrc.m_bHDR = ASTC_IsHDRFormat( d3dFmt );
-				astcSrc.m_bSRGB = ( format->m_glIntFormatSRGB != format->m_glIntFormat ) && ( intformat == format->m_glIntFormatSRGB );
-				astcSrc.m_bForceOpaque = ASTC_IsOpaqueFormat( d3dFmt );
-
-				ASTCEncodeResult astcResult = {};
-				ASTC_EncodeRequired( astcSrc, &astcResult );
-
-				// http://www.opengl.org/sdk/docs/man/xhtml/glCompressedTexImage3D.xml
-				gGL->glCompressedTexImage3D(	target,
-											desc->m_req.m_mip,
-											(GLenum)astcResult.m_glInternalFormat,
-											slice->m_xSize,
-											slice->m_ySize,
-											slice->m_zSize,
-											0,
-											astcResult.m_nDataSize,
-											astcResult.m_pData );
-				ASTC_FreeResult( &astcResult );
 			}
 			else
 			{
