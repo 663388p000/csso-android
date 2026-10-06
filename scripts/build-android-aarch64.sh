@@ -25,19 +25,10 @@ ANDROID_TRIPLE="aarch64-linux-android"
 ANDROID_TARGET="${ANDROID_TRIPLE}${ANDROID_API}"
 
 ###############################################################################
-# Header
+# Android NDK
 ###############################################################################
 
 echo
-echo "========================================"
-echo " Android AArch64 build"
-echo "========================================"
-echo
-
-###############################################################################
-# Android NDK r10e
-###############################################################################
-
 echo "========================================"
 echo " Android NDK r10e"
 echo "========================================"
@@ -58,16 +49,31 @@ export NDK="${ROOT}/${NDK_VERSION}"
 export NDK_HOME="${NDK}"
 export ANDROID_NDK_HOME="${NDK}"
 
-echo "NDK:"
-echo "  ${NDK}"
-
 ###############################################################################
-# Android sysroot
+# Android paths
 ###############################################################################
 
 ANDROID_SYSROOT="${NDK}/platforms/android-${ANDROID_API}/arch-arm64"
 
 ANDROID_GCC_TOOLCHAIN="${NDK}/toolchains/aarch64-linux-android-4.9/prebuilt/linux-x86_64"
+
+###############################################################################
+# libc++
+#
+# NDK r10e keeps libc++ here.
+###############################################################################
+
+ANDROID_LIBCXX="${NDK}/sources/cxx-stl/llvm-libc++"
+
+ANDROID_LIBCXX_INCLUDE="${ANDROID_LIBCXX}/include"
+
+ANDROID_LIBCXXABI_INCLUDE="${ANDROID_LIBCXX}/libcxxabi/include"
+
+ANDROID_LIBCXX_LIB="${ANDROID_LIBCXX}/libs/arm64-v8a"
+
+###############################################################################
+# Verify Android paths
+###############################################################################
 
 if [ ! -d "${ANDROID_SYSROOT}" ]; then
     echo
@@ -78,22 +84,50 @@ fi
 
 if [ ! -d "${ANDROID_GCC_TOOLCHAIN}" ]; then
     echo
-    echo "ERROR: Android AArch64 GCC toolchain not found:"
+    echo "ERROR: Android GCC toolchain not found:"
     echo "  ${ANDROID_GCC_TOOLCHAIN}"
     exit 1
 fi
 
+if [ ! -d "${ANDROID_LIBCXX_INCLUDE}" ]; then
+    echo
+    echo "ERROR: Android libc++ headers not found:"
+    echo "  ${ANDROID_LIBCXX_INCLUDE}"
+    exit 1
+fi
+
+if [ ! -d "${ANDROID_LIBCXXABI_INCLUDE}" ]; then
+    echo
+    echo "ERROR: Android libc++abi headers not found:"
+    echo "  ${ANDROID_LIBCXXABI_INCLUDE}"
+    exit 1
+fi
+
+echo "NDK:"
+echo "  ${NDK}"
+
+echo
 echo "Android target:"
 echo "  ${ANDROID_TARGET}"
 
+echo
 echo "Android sysroot:"
 echo "  ${ANDROID_SYSROOT}"
 
+echo
 echo "Android GCC toolchain:"
 echo "  ${ANDROID_GCC_TOOLCHAIN}"
 
+echo
+echo "Android libc++:"
+echo "  ${ANDROID_LIBCXX}"
+
+echo
+echo "Android libc++ headers:"
+echo "  ${ANDROID_LIBCXX_INCLUDE}"
+
 ###############################################################################
-# LLVM / Clang 11.1.0
+# LLVM / Clang
 ###############################################################################
 
 echo
@@ -123,6 +157,7 @@ export PATH="${LLVM_DIR}/bin:${PATH}"
 
 ANDROID_CC="${LLVM_DIR}/bin/clang"
 ANDROID_CXX="${LLVM_DIR}/bin/clang++"
+ANDROID_LLD="${LLVM_DIR}/bin/ld.lld"
 
 if [ ! -x "${ANDROID_CC}" ]; then
     echo "ERROR: clang not found:"
@@ -136,28 +171,17 @@ if [ ! -x "${ANDROID_CXX}" ]; then
     exit 1
 fi
 
-echo
-echo "Clang:"
-"${ANDROID_CC}" --version | head -n 1
-
-###############################################################################
-# LLVM LLD
-###############################################################################
-
-echo
-echo "========================================"
-echo " LLVM LLD"
-echo "========================================"
-
-ANDROID_LLD="${LLVM_DIR}/bin/ld.lld"
-
 if [ ! -x "${ANDROID_LLD}" ]; then
-    echo
     echo "ERROR: ld.lld not found:"
     echo "  ${ANDROID_LLD}"
     exit 1
 fi
 
+echo
+echo "Clang:"
+"${ANDROID_CC}" --version | head -n 1
+
+echo
 echo "LLD:"
 "${ANDROID_LLD}" --version
 
@@ -182,20 +206,86 @@ if [ ! -x "${ANDROID_RANLIB}" ]; then
 fi
 
 ###############################################################################
-# NDK r10e must NOT use modern CMake Android toolchain
+# C++ standard library
 ###############################################################################
 
-ANDROID_TOOLCHAIN_FILE="${NDK}/build/cmake/android.toolchain.cmake"
+echo
+echo "========================================"
+echo " Android C++ standard library"
+echo "========================================"
 
-if [ -f "${ANDROID_TOOLCHAIN_FILE}" ]; then
+###############################################################################
+# NDK r10e libc++ static library
+###############################################################################
+
+ANDROID_LIBCXX_STATIC=""
+
+for LIBCXX in \
+    "${ANDROID_LIBCXX_LIB}/libc++.a" \
+    "${ANDROID_LIBCXX}/libs/arm64-v8a/libc++.a"
+do
+
+    if [ -f "${LIBCXX}" ]; then
+        ANDROID_LIBCXX_STATIC="${LIBCXX}"
+        break
+    fi
+
+done
+
+if [ -z "${ANDROID_LIBCXX_STATIC}" ]; then
+
     echo
-    echo "ERROR: unexpected modern Android CMake toolchain found:"
-    echo "  ${ANDROID_TOOLCHAIN_FILE}"
-    exit 1
+    echo "WARNING: libc++.a was not found in the expected location."
+
+    echo
+    echo "Searching NDK:"
+
+    find "${ANDROID_LIBCXX}" \
+        -name 'libc++.a' \
+        -print \
+        2>/dev/null || true
+
+else
+
+    echo
+    echo "libc++.a:"
+    echo "  ${ANDROID_LIBCXX_STATIC}"
+
 fi
 
 ###############################################################################
-# Clear externally supplied CMake Android toolchain
+# C++ flags
+###############################################################################
+
+ASTCENC_CXXFLAGS="\
+--target=${ANDROID_TARGET} \
+--sysroot=${ANDROID_SYSROOT} \
+--gcc-toolchain=${ANDROID_GCC_TOOLCHAIN} \
+-isystem${ANDROID_LIBCXX_INCLUDE} \
+-isystem${ANDROID_LIBCXXABI_INCLUDE} \
+-stdlib=libc++"
+
+###############################################################################
+# C flags
+###############################################################################
+
+ASTCENC_CFLAGS="\
+--target=${ANDROID_TARGET} \
+--sysroot=${ANDROID_SYSROOT} \
+--gcc-toolchain=${ANDROID_GCC_TOOLCHAIN}"
+
+###############################################################################
+# Link flags
+###############################################################################
+
+ASTCENC_LDFLAGS="\
+--target=${ANDROID_TARGET} \
+--sysroot=${ANDROID_SYSROOT} \
+--gcc-toolchain=${ANDROID_GCC_TOOLCHAIN} \
+-fuse-ld=lld"
+
+###############################################################################
+# Clear external CMake Android configuration
 ###############################################################################
 
 unset CMAKE_TOOLCHAIN_FILE || true
@@ -205,7 +295,7 @@ unset CMAKE_ANDROID_API || true
 unset CMAKE_ANDROID_NDK || true
 
 ###############################################################################
-# ASTC Encoder source
+# ASTC Encoder
 ###############################################################################
 
 echo
@@ -220,11 +310,8 @@ if [ ! -d "${ASTCENC_DIR}/.git" ]; then
         --branch "${ASTCENC_VERSION}" \
         https://github.com/ARM-software/astc-encoder.git \
         "${ASTCENC_DIR}"
-fi
 
-###############################################################################
-# Verify ASTCENC commit
-###############################################################################
+fi
 
 ASTCENC_COMMIT="$(git -C "${ASTCENC_DIR}" rev-parse HEAD)"
 
@@ -233,7 +320,7 @@ echo "ASTCENC commit:"
 echo "  ${ASTCENC_COMMIT}"
 
 ###############################################################################
-# Clean ASTCENC build
+# Clean build
 ###############################################################################
 
 rm -rf "${ASTCENC_BUILD}"
@@ -244,47 +331,29 @@ mkdir -p "${ASTCENC_INSTALL}/include"
 mkdir -p "${ASTCENC_INSTALL}/lib"
 
 ###############################################################################
-# Compiler flags
+# Show flags
 ###############################################################################
 
-ASTCENC_CFLAGS="--target=${ANDROID_TARGET} --sysroot=${ANDROID_SYSROOT} --gcc-toolchain=${ANDROID_GCC_TOOLCHAIN}"
+echo
+echo "CFLAGS:"
+echo "  ${ASTCENC_CFLAGS}"
 
-ASTCENC_CXXFLAGS="--target=${ANDROID_TARGET} --sysroot=${ANDROID_SYSROOT} --gcc-toolchain=${ANDROID_GCC_TOOLCHAIN}"
+echo
+echo "CXXFLAGS:"
+echo "  ${ASTCENC_CXXFLAGS}"
 
-ASTCENC_LDFLAGS="--target=${ANDROID_TARGET} --sysroot=${ANDROID_SYSROOT} --gcc-toolchain=${ANDROID_GCC_TOOLCHAIN} -fuse-ld=lld"
+echo
+echo "LDFLAGS:"
+echo "  ${ASTCENC_LDFLAGS}"
 
 ###############################################################################
-# CMake configuration
+# CMake configure
 ###############################################################################
 
 echo
 echo "========================================"
 echo " CMake ASTCENC configuration"
 echo "========================================"
-
-echo "Compiler:"
-echo "  ${ANDROID_CC}"
-
-echo "C++ compiler:"
-echo "  ${ANDROID_CXX}"
-
-echo "Target:"
-echo "  ${ANDROID_TARGET}"
-
-echo "Sysroot:"
-echo "  ${ANDROID_SYSROOT}"
-
-echo "GCC toolchain:"
-echo "  ${ANDROID_GCC_TOOLCHAIN}"
-
-echo "CFLAGS:"
-echo "  ${ASTCENC_CFLAGS}"
-
-echo "CXXFLAGS:"
-echo "  ${ASTCENC_CXXFLAGS}"
-
-echo "LDFLAGS:"
-echo "  ${ASTCENC_LDFLAGS}"
 
 cmake \
     -S "${ASTCENC_DIR}" \
@@ -302,6 +371,8 @@ cmake \
     -DCMAKE_AR="${ANDROID_AR}" \
     -DCMAKE_RANLIB="${ANDROID_RANLIB}" \
     -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+    -DCMAKE_CXX_STANDARD=11 \
+    -DCMAKE_CXX_STANDARD_REQUIRED=ON \
     -DASTCENC_ISA_AVX2=OFF \
     -DASTCENC_ISA_SSE41=OFF \
     -DASTCENC_ISA_SSE2=OFF \
@@ -317,7 +388,7 @@ cmake \
     -DASTCENC_CLI=OFF
 
 ###############################################################################
-# Build ONLY the ASTCENC static codec library
+# Build ASTCENC
 ###############################################################################
 
 echo
@@ -332,7 +403,7 @@ cmake \
     --parallel "$(nproc)"
 
 ###############################################################################
-# Find astcenc.h
+# Find header
 ###############################################################################
 
 echo
@@ -361,8 +432,6 @@ if [ -z "${ASTCENC_HEADER_SOURCE}" ]; then
     echo
     echo "ERROR: astcenc.h not found."
 
-    echo
-    echo "Searching:"
     find "${ASTCENC_DIR}" \
         "${ASTCENC_BUILD}" \
         -name astcenc.h \
@@ -376,22 +445,18 @@ cp \
     "${ASTCENC_HEADER_SOURCE}" \
     "${ASTCENC_INSTALL}/include/astcenc.h"
 
-echo
-echo "Header:"
-echo "  ${ASTCENC_INSTALL}/include/astcenc.h"
-
 ###############################################################################
-# Find ASTCENC static library
+# Find library
 ###############################################################################
 
 ASTCENC_LIBRARY_SOURCE=""
 
 for LIB in \
-    "${ASTCENC_BUILD}/libastcenc-neon-static.a" \
     "${ASTCENC_BUILD}/Source/libastcenc-neon-static.a" \
-    "${ASTCENC_BUILD}/lib/libastcenc-neon-static.a" \
-    "${ASTCENC_BUILD}/libastcenc.a" \
+    "${ASTCENC_BUILD}/libastcenc-neon-static.a" \
     "${ASTCENC_BUILD}/Source/libastcenc.a" \
+    "${ASTCENC_BUILD}/libastcenc.a" \
+    "${ASTCENC_BUILD}/lib/libastcenc-neon-static.a" \
     "${ASTCENC_BUILD}/lib/libastcenc.a"
 do
 
@@ -403,7 +468,7 @@ do
 done
 
 ###############################################################################
-# Fallback search
+# Fallback
 ###############################################################################
 
 if [ -z "${ASTCENC_LIBRARY_SOURCE}" ]; then
@@ -422,31 +487,18 @@ if [ -z "${ASTCENC_LIBRARY_SOURCE}" ]; then
 
 fi
 
-###############################################################################
-# Library must exist
-###############################################################################
-
 if [ -z "${ASTCENC_LIBRARY_SOURCE}" ]; then
 
     echo
     echo "ERROR: ASTCENC static library not found."
 
     echo
-    echo "All static libraries in build tree:"
+    echo "Static libraries:"
     find "${ASTCENC_BUILD}" \
         -type f \
         -name '*.a' \
         -print \
         2>/dev/null || true
-
-    echo
-    echo "All build files:"
-    find "${ASTCENC_BUILD}" \
-        -maxdepth 4 \
-        -type f \
-        -print \
-        2>/dev/null \
-        | head -n 200 || true
 
     exit 1
 fi
@@ -457,44 +509,30 @@ fi
 
 ASTCENC_LIBRARY_NAME="$(basename "${ASTCENC_LIBRARY_SOURCE}")"
 
-cp \
-    "${ASTCENC_LIBRARY_SOURCE}" \
-    "${ASTCENC_INSTALL}/lib/${ASTCENC_LIBRARY_NAME}"
-
 ASTCENC_LIBRARY="${ASTCENC_INSTALL}/lib/${ASTCENC_LIBRARY_NAME}"
 
-###############################################################################
-# Verify header
-###############################################################################
-
-if [ ! -f "${ASTCENC_INSTALL}/include/astcenc.h" ]; then
-
-    echo
-    echo "ERROR: ASTCENC header installation failed."
-
-    exit 1
-fi
+cp \
+    "${ASTCENC_LIBRARY_SOURCE}" \
+    "${ASTCENC_LIBRARY}"
 
 ###############################################################################
-# Verify library
-###############################################################################
-
-if [ ! -f "${ASTCENC_LIBRARY}" ]; then
-
-    echo
-    echo "ERROR: ASTCENC library installation failed."
-
-    exit 1
-fi
-
-###############################################################################
-# Verify architecture
+# Verify
 ###############################################################################
 
 echo
 echo "========================================"
 echo " ASTCENC verification"
 echo "========================================"
+
+if [ ! -f "${ASTCENC_INSTALL}/include/astcenc.h" ]; then
+    echo "ERROR: astcenc.h missing."
+    exit 1
+fi
+
+if [ ! -f "${ASTCENC_LIBRARY}" ]; then
+    echo "ERROR: ASTCENC library missing."
+    exit 1
+fi
 
 echo
 echo "Header:"
@@ -505,20 +543,8 @@ echo "Library:"
 echo "  ${ASTCENC_LIBRARY}"
 
 echo
-echo "Library file:"
+echo "Library type:"
 file "${ASTCENC_LIBRARY}" || true
-
-###############################################################################
-# Verify AArch64 object inside archive
-###############################################################################
-
-if command -v llvm-ar >/dev/null 2>&1; then
-
-    echo
-    echo "Archive members:"
-    llvm-ar t "${ASTCENC_LIBRARY}" | head -n 10 || true
-
-fi
 
 ###############################################################################
 # Export ASTCENC_ROOT
@@ -534,19 +560,13 @@ echo "========================================"
 echo "ASTCENC_ROOT:"
 echo "  ${ASTCENC_ROOT}"
 
-echo "Include:"
-echo "  ${ASTCENC_INSTALL}/include"
-
-echo "Library:"
-echo "  ${ASTCENC_LIBRARY}"
-
 ###############################################################################
 # Waf
 ###############################################################################
 
 echo
 echo "========================================"
-echo " Waf configure"
+echo " Waf"
 echo "========================================"
 
 chmod +x waf
@@ -590,7 +610,7 @@ echo "========================================"
 ./waf install
 
 ###############################################################################
-# Complete
+# Done
 ###############################################################################
 
 echo
