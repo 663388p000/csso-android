@@ -16,27 +16,162 @@ def options(opt):
 def configure(conf):
 	conf.define('TOGL_DLL_EXPORT', 1)
 
+	# ASTCENC is mandatory.
+	#
+	# HAVE_ASTCENC is always enabled because ASTC support is required.
 	conf.env.append_unique('DEFINES', [
 		'strncpy=use_Q_strncpy_instead',
 		'_snprintf=use_Q_snprintf_instead',
 		'HAVE_ASTCENC=1',
 	])
 
-	# ASTC LDR/HDR runtime texture recompression
+	# ------------------------------------------------------------
+	# ASTCENC
+	# ------------------------------------------------------------
 	#
-	# ASTCENC IS REQUIRED.
+	# ASTCENC_ROOT must point to an ASTCENC installation built
+	# for the current target platform.
 	#
-	# Required:
-	#   - astcenc.h
-	#   - libastcenc
+	# Example:
 	#
-	# Debian/Ubuntu:
-	#   sudo apt install libastcenc-dev
+	#   export ASTCENC_ROOT=/path/to/astcenc-android
 	#
-	# If astcenc is missing, configuration MUST fail.
+	# Expected layout:
+	#
+	#   astcenc-android/
+	#   ├── include/
+	#   │   └── astcenc.h
+	#   └── lib/
+	#       └── libastcenc.a
+	#
+	# Do NOT use the host Linux libastcenc when building Android.
+	#
+
+	astcenc_root = os.environ.get('ASTCENC_ROOT')
+
+	if not astcenc_root:
+		conf.fatal(
+			'ASTCENC_ROOT is required. '
+			'ASTCENC must be built for the target platform.'
+		)
+
+	astcenc_root = os.path.abspath(astcenc_root)
+
+	astcenc_include = os.path.join(
+		astcenc_root,
+		'include'
+	)
+
+	astcenc_lib = os.path.join(
+		astcenc_root,
+		'lib'
+	)
+
+	astcenc_header = os.path.join(
+		astcenc_include,
+		'astcenc.h'
+	)
+
+	# ------------------------------------------------------------
+	# Check ASTCENC header
+	# ------------------------------------------------------------
+
+	if not os.path.isfile(astcenc_header):
+		conf.fatal(
+			'ASTCENC header not found:\n  %s\n'
+			'ASTCENC_ROOT=%s' %
+			(astcenc_header, astcenc_root)
+		)
+
+	# ------------------------------------------------------------
+	# Find ASTCENC library
+	# ------------------------------------------------------------
+
+	astcenc_library = None
+	astcenc_library_name = None
+
+	# Normal static library name.
+	candidates = [
+		'libastcenc.a',
+
+		# Some ASTCENC builds may use a NEON-specific name.
+		'libastcenc-neon-static.a',
+
+		# Also allow shared library builds.
+		'libastcenc.so',
+		'libastcenc.dylib',
+	]
+
+	for filename in candidates:
+		path = os.path.join(
+			astcenc_lib,
+			filename
+		)
+
+		if os.path.isfile(path):
+			astcenc_library = path
+
+			# Waf library name without lib prefix / extension.
+			astcenc_library_name = filename
+
+			if astcenc_library_name.startswith('lib'):
+				astcenc_library_name = astcenc_library_name[3:]
+
+			if astcenc_library_name.endswith('.a'):
+				astcenc_library_name = astcenc_library_name[:-2]
+			elif astcenc_library_name.endswith('.so'):
+				astcenc_library_name = astcenc_library_name[:-3]
+			elif astcenc_library_name.endswith('.dylib'):
+				astcenc_library_name = astcenc_library_name[:-6]
+
+			break
+
+	if astcenc_library is None:
+		conf.fatal(
+			'ASTCENC library not found in:\n  %s\n'
+			'Expected one of:\n'
+			'  libastcenc.a\n'
+			'  libastcenc-neon-static.a\n'
+			'  libastcenc.so\n'
+			'  libastcenc.dylib' %
+			astcenc_lib
+		)
+
+	# ------------------------------------------------------------
+	# Tell Waf where ASTCENC lives
+	# ------------------------------------------------------------
+
+	conf.env.INCLUDES_ASTCENC = [
+		astcenc_include
+	]
+
+	conf.env.LIBPATH_ASTCENC = [
+		astcenc_lib
+	]
+
+	conf.env.LIB_ASTCENC = [
+		astcenc_library_name
+	]
+
+	# ------------------------------------------------------------
+	# Verify the header with the actual compiler
+	# ------------------------------------------------------------
+
 	conf.check_cc(
-		lib='astcenc',
 		header_name='astcenc.h',
+		includes=astcenc_include,
+		uselib_store='ASTCENC',
+		mandatory=True
+	)
+
+	# ------------------------------------------------------------
+	# Verify the actual ASTCENC library
+	# ------------------------------------------------------------
+
+	conf.check_cc(
+		lib=astcenc_library_name,
+		libpath=astcenc_lib,
+		includes=astcenc_include,
 		uselib_store='ASTCENC',
 		mandatory=True
 	)
@@ -51,8 +186,8 @@ def build(bld):
 		'linuxwin/glmgrbasics.cpp',
 
 		# OSX:
-		#'linuxwin/intelglmallocworkaround.cpp',
-		#'linuxwin/mach_override.c',
+		# 'linuxwin/intelglmallocworkaround.cpp',
+		# 'linuxwin/mach_override.c',
 
 		'linuxwin/cglmtex.cpp',
 		'linuxwin/cglmfbo.cpp',
@@ -76,10 +211,17 @@ def build(bld):
 		'../public/tier1'
 	] + bld.env.INCLUDES_SDL2
 
-	defines = []
+	defines = [
+		'HAVE_ASTCENC=1',
+	]
 
 	# ASTCENC is REQUIRED.
-	# Do not make this conditional.
+	#
+	# configure() has already verified:
+	#   - astcenc.h
+	#   - ASTCENC library
+	#
+	# Therefore this must NEVER be conditional.
 	libs = [
 		'tier0',
 		'tier1',
@@ -91,8 +233,8 @@ def build(bld):
 
 	if bld.env.DEST_OS == "darwin":
 		libs += [
-			"OPENGL",
-			"CARBON"
+			'OPENGL',
+			'CARBON',
 		]
 
 	install_path = bld.env.LIBDIR
