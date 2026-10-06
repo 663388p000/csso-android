@@ -7,46 +7,67 @@ import os
 top = '.'
 PROJECT_NAME = 'togl'
 
+
 def options(opt):
 	# stub
 	return
 
-def configure(conf):
-	conf.define('TOGL_DLL_EXPORT',1)
-	conf.env.append_unique('DEFINES',['strncpy=use_Q_strncpy_instead',
-		'_snprintf=use_Q_snprintf_instead'])
 
-	# ASTC LDR/HDR runtime texture recompression (added) -- optional:
-	# needs `libastcenc-dev` (apt) / the astcenc dev package for your distro.
-	# When it's not installed the build still succeeds; the feature just
-	# stays inert (ASTC_CompressTexture() returns false at runtime and the
-	# original uncompressed upload path is used instead).
-	conf.check_cc(lib='astcenc', header_name='astcenc.h',
-		uselib_store='ASTCENC', mandatory=False)
-	if conf.env.LIB_ASTCENC:
-		conf.env.append_unique('DEFINES_ASTCENC', ['HAVE_ASTCENC=1'])
+def configure(conf):
+	conf.define('TOGL_DLL_EXPORT', 1)
+
+	conf.env.append_unique('DEFINES', [
+		'strncpy=use_Q_strncpy_instead',
+		'_snprintf=use_Q_snprintf_instead',
+		'HAVE_ASTCENC=1',
+	])
+
+	# ASTC LDR/HDR runtime texture recompression
+	#
+	# ASTCENC IS REQUIRED.
+	#
+	# Required:
+	#   - astcenc.h
+	#   - libastcenc
+	#
+	# Debian/Ubuntu:
+	#   sudo apt install libastcenc-dev
+	#
+	# If astcenc is missing, configuration MUST fail.
+	conf.check_cc(
+		lib='astcenc',
+		header_name='astcenc.h',
+		uselib_store='ASTCENC',
+		mandatory=True
+	)
+
 
 def build(bld):
 	source = [
 		'linuxwin/dx9asmtogl2.cpp',
 		'linuxwin/dxabstract.cpp',
-		'linuxwin/glentrypoints.cpp',	
-		'linuxwin/glmgr.cpp',			
-		'linuxwin/glmgrbasics.cpp',	
-		#'linuxwin/intelglmallocworkaround.cpp',		[$OSXALL]
-		#'linuxwin/mach_override.c',					[$OSXALL]
-		'linuxwin/cglmtex.cpp',		
-		'linuxwin/cglmfbo.cpp',		
-		'linuxwin/cglmprogram.cpp',	
-		'linuxwin/cglmbuffer.cpp',	
+		'linuxwin/glentrypoints.cpp',
+		'linuxwin/glmgr.cpp',
+		'linuxwin/glmgrbasics.cpp',
+
+		# OSX:
+		#'linuxwin/intelglmallocworkaround.cpp',
+		#'linuxwin/mach_override.c',
+
+		'linuxwin/cglmtex.cpp',
+		'linuxwin/cglmfbo.cpp',
+		'linuxwin/cglmprogram.cpp',
+		'linuxwin/cglmbuffer.cpp',
 		'linuxwin/cglmquery.cpp',
 		'linuxwin/asanstubs.cpp',
 		'linuxwin/decompress.c',
-        'linuxwin/astc_texcompress.cpp',			
+		'linuxwin/astc_texcompress.cpp',
 	]
 
 	if bld.env.DEST_OS == "darwin":
-		source += ['linuxwin/glmgrcocoa.mm']
+		source += [
+			'linuxwin/glmgrcocoa.mm'
+		]
 
 	includes = [
 		'.',
@@ -57,27 +78,34 @@ def build(bld):
 
 	defines = []
 
-	libs = ['tier0','tier1','tier2','vstdlib','mathlib']
-
-	# added: link against astcenc when configure() found it; harmless no-op
-	# (empty uselib) when it wasn't found, HAVE_ASTCENC just won't be defined.
-	if bld.env.LIB_ASTCENC:
-		libs += ['ASTCENC']
+	# ASTCENC is REQUIRED.
+	# Do not make this conditional.
+	libs = [
+		'tier0',
+		'tier1',
+		'tier2',
+		'vstdlib',
+		'mathlib',
+		'ASTCENC',
+	]
 
 	if bld.env.DEST_OS == "darwin":
-		libs += ["OPENGL", "CARBON"]
+		libs += [
+			"OPENGL",
+			"CARBON"
+		]
 
 	install_path = bld.env.LIBDIR
 
 	bld.shlib(
-		source   = source,
-		target   = PROJECT_NAME,
-		name     = PROJECT_NAME,
-		features = 'c cxx',
-		includes = includes,
-		defines  = defines,
-		use      = libs,
-		install_path = install_path,
-		subsystem = bld.env.MSVC_SUBSYSTEM,
-		idx      = bld.get_taskgen_count()
+		source=source,
+		target=PROJECT_NAME,
+		name=PROJECT_NAME,
+		features='c cxx',
+		includes=includes,
+		defines=defines,
+		use=libs,
+		install_path=install_path,
+		subsystem=bld.env.MSVC_SUBSYSTEM,
+		idx=bld.get_taskgen_count()
 	)
