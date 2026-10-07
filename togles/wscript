@@ -161,6 +161,41 @@ def configure(conf):
 		'enabled'
 	)
 
+	# ------------------------------------------------------------
+	# Android: libc++ runtime
+	# ------------------------------------------------------------
+	#
+	# On Android targets clang compiles against libc++ headers (std::__1),
+	# both for this module and for the prebuilt astcenc archive. The link
+	# line, however, uses -stdlib=libstdc++, so the out-of-line libc++
+	# symbols (std::__1::mutex, condition_variable, thread,
+	# bad_function_call, RTTI vtables ...) are never linked and libtogl.so
+	# fails with "undefined symbol: std::__1::mutex::lock()".
+	#
+	# Link the NDK's static libc++ explicitly. It also carries the C++ ABI
+	# bits (gabi++), which fixes the runtime dlopen error about
+	# _ZTVN10__cxxabiv117__class_type_infoE.
+
+	if conf.env.DEST_OS == 'android':
+		ndk = (os.environ.get('ANDROID_NDK')
+			or os.environ.get('ANDROID_NDK_HOME')
+			or os.environ.get('NDK_HOME'))
+
+		if not ndk:
+			conf.fatal('ANDROID_NDK is required to locate libc++_static.a')
+
+		libcxx_dir = os.path.join(
+			ndk,
+			'sources', 'cxx-stl', 'llvm-libc++', 'libs', 'arm64-v8a'
+		)
+
+		if not os.path.isfile(os.path.join(libcxx_dir, 'libc++_static.a')):
+			conf.fatal('libc++_static.a not found in %s' % libcxx_dir)
+
+		conf.env.STLIBPATH_LIBCXX = [libcxx_dir]
+		conf.env.STLIB_LIBCXX = ['c++_static']
+		conf.msg('Android libc++ runtime', libcxx_dir)
+
 
 def build(bld):
 	source = [
@@ -234,6 +269,12 @@ def build(bld):
 		'mathlib',
 		'ASTCENC',
 	]
+
+	# Must come after ASTCENC: the static archive resolves its libc++ refs.
+	if bld.env.DEST_OS == "android":
+		libs += [
+			'LIBCXX',
+		]
 
 	if bld.env.DEST_OS == "darwin":
 		libs += [
