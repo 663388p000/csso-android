@@ -1,5 +1,5 @@
 ###############################################################################
-# ASTCENC ONLY
+# Build ASTC Encoder
 ###############################################################################
 
 ASTC_CFLAGS="\
@@ -55,15 +55,69 @@ cmake --build "${ASTCENC_BUILD}" \
 
 
 ###############################################################################
-# ASTCENC DONE
+# Install ASTC Encoder
 ###############################################################################
 
 echo
-echo "ASTCENC build finished."
+echo "========================================"
+echo " Install ASTC Encoder"
+echo "========================================"
+
+ASTCENC_HEADER="${ASTCENC_DIR}/Source/astcenc.h"
+
+if [ ! -f "${ASTCENC_HEADER}" ]; then
+    echo "ERROR: ASTCENC header not found:"
+    echo "  ${ASTCENC_HEADER}"
+    exit 1
+fi
+
+cp "${ASTCENC_HEADER}" \
+    "${ASTCENC_INSTALL}/include/astcenc.h"
+
+ASTCENC_LIBRARY="$(find "${ASTCENC_BUILD}" \
+    -type f \
+    -name 'libastcenc-neon-static.a' \
+    -print -quit)"
+
+if [ -z "${ASTCENC_LIBRARY}" ]; then
+    echo "ERROR: ASTCENC static library not found."
+    exit 1
+fi
+
+cp "${ASTCENC_LIBRARY}" \
+    "${ASTCENC_INSTALL}/lib/libastcenc-neon-static.a"
+
+echo
+echo "ASTCENC files:"
+find "${ASTCENC_INSTALL}" -type f -print
 
 
 ###############################################################################
-# DESTROY ASTCENC COMPILER ENVIRONMENT
+# Export ASTCENC_ROOT
+###############################################################################
+
+export ASTCENC_ROOT="${ASTCENC_INSTALL}"
+
+echo
+echo "ASTCENC_ROOT:"
+echo "  ${ASTCENC_ROOT}"
+
+if [ ! -f "${ASTCENC_ROOT}/include/astcenc.h" ]; then
+    echo "ERROR: astcenc.h missing."
+    exit 1
+fi
+
+if [ ! -f "${ASTCENC_ROOT}/lib/libastcenc-neon-static.a" ]; then
+    echo "ERROR: libastcenc-neon-static.a missing."
+    exit 1
+fi
+
+
+###############################################################################
+# ASTCENC IS COMPLETELY FINISHED
+#
+# Keep ASTCENC_ROOT.
+# Everything related to its compiler environment is discarded.
 ###############################################################################
 
 unset ASTC_CFLAGS
@@ -102,10 +156,15 @@ unset CMAKE_ANDROID_API
 
 
 ###############################################################################
-# WAF ENVIRONMENT
-#
-# NOTHING FROM ASTCENC IS REUSED HERE.
+# Prepare Waf environment
 ###############################################################################
+
+echo
+echo "========================================"
+echo " Prepare Waf environment"
+echo "========================================"
+
+chmod +x waf
 
 export ANDROID_NDK="$PWD/android-ndk-r10e/"
 export ANDROID_NDK_HOME="$PWD/android-ndk-r10e/"
@@ -115,24 +174,38 @@ chmod +x "$HOME/llvm11/bin/llvm-strip"
 
 export PATH="$HOME/llvm11/bin:$PATH"
 
-###############################################################################
-# WAF ONLY
-###############################################################################
-
 export CC="$HOME/llvm11/bin/clang"
 export CXX="$HOME/llvm11/bin/clang++"
 export AR="$HOME/llvm11/bin/llvm-ar"
 export RANLIB="$HOME/llvm11/bin/llvm-ranlib"
 export STRIP="$HOME/llvm11/bin/llvm-strip"
+export LD="$HOME/llvm11/bin/ld.lld"
 
 export CFLAGS="-O2"
 export CXXFLAGS="-O2"
 export LDFLAGS="-s -flto"
 
+echo
+echo "Waf Android environment:"
+echo "  ANDROID_NDK      = ${ANDROID_NDK}"
+echo "  ANDROID_NDK_HOME = ${ANDROID_NDK_HOME}"
+echo "  NDK_HOME         = ${NDK_HOME}"
+echo "  ASTCENC_ROOT     = ${ASTCENC_ROOT}"
+
+echo
+echo "Compiler:"
+echo "  CC  = ${CC}"
+echo "  CXX = ${CXX}"
+
 
 ###############################################################################
-# WAF
+# Waf configure
 ###############################################################################
+
+echo
+echo "========================================"
+echo " Waf configure"
+echo "========================================"
 
 ./waf configure \
     -T release \
@@ -142,5 +215,26 @@ export LDFLAGS="-s -flto"
     --prefix=./output \
     --disable-warns
 
+
+###############################################################################
+# Waf build
+###############################################################################
+
+echo
+echo "========================================"
+echo " Waf build"
+echo "========================================"
+
 ./waf build
+
+
+###############################################################################
+# Waf install
+###############################################################################
+
+echo
+echo "========================================"
+echo " Waf install"
+echo "========================================"
+
 ./waf install
