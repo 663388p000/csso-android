@@ -3503,51 +3503,65 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 
 	// Mandatory: DXT bytes are never pushed to the GPU anymore, not even when
 	// the driver natively supports GL_EXT_texture_compression_dxt1 -- this
-	// function is now called unconditionally for every DXT1/3/5 texture (see
-	// the WriteTexels call site), with no native-DXT-upload branch left.
+	// function is called unconditionally for every DXT1/3/5 texture (see the
+	// WriteTexels call site), with no native-DXT-upload branch left.
 	// uncompressDXTc() above already decoded the source to RGB(A); re-encode
 	// those pixels as ASTC here instead of uploading them raw. DXT1/3/5 is
 	// always 8-bit normalized color, so this is always LDR, never HDR.
-	if ( pixels && data )
+	//
+	// uncompressDXTc() hands back the caller's own pointer when the stream is
+	// already uncompressed, so only free what we allocated ourselves.
+	bool ownsPixels = ( pixels != NULL ) && ( pixels != data );
+
+	if ( !pixels )
 	{
-		const void *rgbaSrc = pixels;
-		uint8_t *paddedRGBA = NULL;
-
-		if ( !hasAlpha )
+		if ( data )
 		{
-			// DXT1-no-alpha decodes to tightly packed 3-byte RGB; ASTC
-			// encoding wants 4-byte RGBA, so pad in an opaque alpha channel.
-			int nPixels = width * height;
-			const uint8_t *rgb = (const uint8_t*)pixels;
-			paddedRGBA = (uint8_t*)malloc( (size_t)nPixels * 4 );
-			for ( int i = 0; i < nPixels; ++i )
-			{
-				paddedRGBA[i*4+0] = rgb[i*3+0];
-				paddedRGBA[i*4+1] = rgb[i*3+1];
-				paddedRGBA[i*4+2] = rgb[i*3+2];
-				paddedRGBA[i*4+3] = 255;
-			}
-			rgbaSrc = paddedRGBA;
+			// Non-DXT internalformat with data: treat as raw RGB(A) texels.
+			pixels = (GLvoid*)data;
 		}
-
-		ASTCEncodeResult astcResult = {};
-		ASTC_CompressTextureRequired( /*isHDR=*/false, srgb, /*forceOpaque=*/!hasAlpha, rgbaSrc, width, height,
-									   GL_RGBA, GL_UNSIGNED_BYTE, &astcResult );
-
-		gGL->glCompressedTexImage2D( target, level, (GLenum)astcResult.m_glInternalFormat,
-									  width, height, border,
-									  astcResult.m_nDataSize, astcResult.m_pData );
-		ASTC_FreeResult( &astcResult );
-
-		if ( paddedRGBA )
-			free( paddedRGBA );
-		free( pixels );
-		return;
+		else
+		{
+			// No source data (storage-only definition): define the level as
+			// zero-filled ASTC so the texture still never exists uncompressed.
+			pixels = calloc( (size_t)width * height, hasAlpha ? 4 : 3 );
+			ownsPixels = true;
+		}
 	}
 
-	gGL->glTexImage2D(target, level, intformat, width, height, border, format, type, pixels);
-	if( data != pixels )
-		free(pixels);
+	const void *rgbaSrc = pixels;
+	uint8_t *paddedRGBA = NULL;
+
+	if ( !hasAlpha )
+	{
+		// DXT1-no-alpha decodes to tightly packed 3-byte RGB; ASTC
+		// encoding wants 4-byte RGBA, so pad in an opaque alpha channel.
+		int nPixels = width * height;
+		const uint8_t *rgb = (const uint8_t*)pixels;
+		paddedRGBA = (uint8_t*)malloc( (size_t)nPixels * 4 );
+		for ( int i = 0; i < nPixels; ++i )
+		{
+			paddedRGBA[i*4+0] = rgb[i*3+0];
+			paddedRGBA[i*4+1] = rgb[i*3+1];
+			paddedRGBA[i*4+2] = rgb[i*3+2];
+			paddedRGBA[i*4+3] = 255;
+		}
+		rgbaSrc = paddedRGBA;
+	}
+
+	ASTCEncodeResult astcResult = {};
+	ASTC_CompressTextureRequired( /*isHDR=*/false, srgb, /*forceOpaque=*/!hasAlpha, rgbaSrc, width, height,
+								   GL_RGBA, GL_UNSIGNED_BYTE, &astcResult );
+
+	gGL->glCompressedTexImage2D( target, level, (GLenum)astcResult.m_glInternalFormat,
+								  width, height, border,
+								  astcResult.m_nDataSize, astcResult.m_pData );
+	ASTC_FreeResult( &astcResult );
+
+	if ( paddedRGBA )
+		free( paddedRGBA );
+	if ( ownsPixels )
+		free( pixels );
 }
 
 // TexSubImage should work properly on every driver stack and GPU--enabling by default.
@@ -3614,7 +3628,13 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 	// allow use of subimage if the target is texture2D and it has already been teximage'd
 	bool mayUseSubImage = false;
 
-	if ( (target==GL_TEXTURE_2D) && (m_sliceFlags[ desc->m_sliceIndex ] & kSliceValid) )
+	// Every non-render-target color texture of an ASTC-eligible format lives on
+	// the GPU as ASTC. glTexSubImage2D with uncompressed data on a compressed
+	// level is GL_INVALID_OPERATION, so these always re-encode the whole slice.
+	const bool bAstcManaged = !( m_layout->m_key.m_texFlags & ( kGLMTexMultisampled | kGLMTexRenderable ) )
+		&& ASTC_IsEligibleFormat( (int)m_layout->m_key.m_texFormat );
+
+	if ( (target==GL_TEXTURE_2D) && !bAstcManaged && (m_sliceFlags[ desc->m_sliceIndex ] & kSliceValid) )
 		mayUseSubImage = true;
 
 	// check flavor, 2D, 3D, or cube map
@@ -3776,11 +3796,7 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 					// "fall back to uncompressed" outcome.
 					// http://www.opengl.org/documentation/specs/man_pages/hardcopy/GL/html/gl/teximage2d.html
 
-					bool bMustASTC = writeWholeSlice
-						&& !noDataWrite
-						&& sliceAddress != NULL
-						&& !(m_layout->m_key.m_texFlags & (kGLMTexMultisampled|kGLMTexRenderable))
-						&& ASTC_IsEligibleFormat( (int)m_layout->m_key.m_texFormat );
+					bool bMustASTC = bAstcManaged;
 
 					if ( bMustASTC )
 					{
@@ -3788,9 +3804,27 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 						bool isSRGB = ( format->m_glIntFormatSRGB != format->m_glIntFormat ) && ( intformat == format->m_glIntFormatSRGB );
 						bool forceOpaque = !ASTC_FormatHasAlpha( (int)m_layout->m_key.m_texFormat );
 
+						// Source: the slice's backing store when we have one (this also
+						// covers partial writes -- the whole slice is re-encoded from the
+						// backing copy). With no data (storage-only definition) define the
+						// level as zero-filled ASTC instead of falling back to uncompressed.
+						const void *astcSrc = ( noDataWrite || !sliceAddress ) ? NULL : sliceAddress;
+						void *zeroSrc = NULL;
+						GLenum astcSrcFormat = glDataFormat;
+						GLenum astcSrcType = glDataType;
+						if ( !astcSrc )
+						{
+							zeroSrc = calloc( (size_t)slice->m_xSize * slice->m_ySize, 4 );
+							astcSrc = zeroSrc;
+							astcSrcFormat = GL_RGBA;
+							astcSrcType = GL_UNSIGNED_BYTE;
+							isHDR = false;
+							forceOpaque = false;
+						}
+
 						ASTCEncodeResult astcResult = {};
-						ASTC_CompressTextureRequired( isHDR, isSRGB, forceOpaque, sliceAddress, slice->m_xSize, slice->m_ySize,
-													   glDataFormat, glDataType, &astcResult );
+						ASTC_CompressTextureRequired( isHDR, isSRGB, forceOpaque, astcSrc, slice->m_xSize, slice->m_ySize,
+													   astcSrcFormat, astcSrcType, &astcResult );
 
 						// http://www.opengl.org/sdk/docs/man/xhtml/glCompressedTexImage2D.xml
 						gGL->glCompressedTexImage2D( target, desc->m_req.m_mip,
@@ -3798,6 +3832,8 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 													  slice->m_xSize, slice->m_ySize, 0,
 													  astcResult.m_nDataSize, astcResult.m_pData );
 						ASTC_FreeResult( &astcResult );
+						if ( zeroSrc )
+							free( zeroSrc );
 					}
 					else
 					{
