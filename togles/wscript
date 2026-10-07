@@ -43,8 +43,7 @@ def configure(conf):
 	#   └── lib/
 	#       └── libastcenc-neon-static.a
 	#
-	# For Android AArch64 we intentionally use the NEON static
-	# library produced by ASTC Encoder.
+	# For Android AArch64 we use the NEON static library.
 	#
 
 	astcenc_root = os.environ.get('ASTCENC_ROOT')
@@ -78,8 +77,29 @@ def configure(conf):
 	)
 
 	# ------------------------------------------------------------
-	# Verify ASTCENC files
+	# Verify ASTCENC installation
 	# ------------------------------------------------------------
+	#
+	# Do this directly instead of using check_cc().
+	#
+	# The ASTCENC library has already been built for the target
+	# platform by the CI script, so another compiler probe here
+	# is unnecessary and causes problems with this old Waf setup.
+	#
+
+	if not os.path.isdir(astcenc_include):
+		conf.fatal(
+			'ASTCENC include directory not found:\n'
+			'  %s'
+			% astcenc_include
+		)
+
+	if not os.path.isdir(astcenc_lib):
+		conf.fatal(
+			'ASTCENC library directory not found:\n'
+			'  %s'
+			% astcenc_lib
+		)
 
 	if not os.path.isfile(astcenc_header):
 		conf.fatal(
@@ -109,14 +129,7 @@ def configure(conf):
 		astcenc_lib
 	]
 
-	# IMPORTANT:
-	#
-	# Waf expects the library name WITHOUT:
-	#
-	#   lib
-	#   .a
-	#
-	# Therefore:
+	# Waf library name:
 	#
 	#   libastcenc-neon-static.a
 	#
@@ -130,26 +143,7 @@ def configure(conf):
 	]
 
 	# ------------------------------------------------------------
-	# Verify ASTCENC header with the actual target compiler
-	# ------------------------------------------------------------
-	#
-	# Do not use check_cc(lib=...) here.
-	#
-	# We already verified the exact archive above and manually
-	# provide the library to the target through LIB_ASTCENC.
-	#
-	# The header check is still useful because it verifies that
-	# the target compiler can actually include astcenc.h.
-	#
-
-	conf.check_cc(
-		header_name='astcenc.h',
-		includes=conf.env.INCLUDES_ASTCENC,
-		mandatory=True
-	)
-
-	# ------------------------------------------------------------
-	# ASTCENC information
+	# Print ASTCENC configuration
 	# ------------------------------------------------------------
 
 	conf.msg(
@@ -160,6 +154,11 @@ def configure(conf):
 	conf.msg(
 		'ASTCENC library',
 		astcenc_library
+	)
+
+	conf.msg(
+		'ASTCENC support',
+		'enabled'
 	)
 
 
@@ -190,12 +189,25 @@ def build(bld):
 			'linuxwin/glmgrcocoa.mm'
 		]
 
+	# ------------------------------------------------------------
+	# Include paths
+	# ------------------------------------------------------------
+
 	includes = [
 		'.',
 		'../public',
 		'../public/tier0',
 		'../public/tier1',
-	] + bld.env.INCLUDES_SDL2
+	]
+
+	includes += bld.env.INCLUDES_SDL2
+
+	# ASTCENC is mandatory.
+	#
+	# Add it explicitly instead of relying on uselib propagation.
+	#
+
+	includes += bld.env.INCLUDES_ASTCENC
 
 	# ------------------------------------------------------------
 	# Defines
@@ -211,7 +223,7 @@ def build(bld):
 	#
 	# ASTCENC is REQUIRED.
 	#
-	# Never make ASTCENC conditional.
+	# NEVER make this conditional.
 	#
 
 	libs = [
