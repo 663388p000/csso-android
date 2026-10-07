@@ -749,7 +749,7 @@ static astcenc_context* AcquireSharedContext( astcenc_profile profile, int bw, i
 }
 
 static astcenc_error EncodeImage( astcenc_profile profile, int bw, int bh, float quality, uint32_t flags,
-								  const astcenc_image& image, const astcenc_swizzle& swz,
+								  astcenc_image& image, const astcenc_swizzle& swz,
 								  uint8_t* out, size_t outSize, bool smallImage )
 {
 	// Tiny images are not worth the fan-out. Use a single-thread context.
