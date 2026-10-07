@@ -1,197 +1,19 @@
-#!/bin/sh
-set -eu
-
 ###############################################################################
-# Paths / versions
+# ASTCENC ONLY
 ###############################################################################
 
-ROOT="$(pwd)"
-
-NDK_VERSION="android-ndk-r10e"
-NDK_ZIP="${NDK_VERSION}-linux-x86_64.zip"
-
-LLVM_VERSION="11.1.0"
-LLVM_ARCHIVE="clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-16.04.tar.xz"
-LLVM_DIR="${HOME}/llvm11"
-
-ASTCENC_VERSION="4.8.0"
-ASTCENC_DIR="${ROOT}/astc-encoder"
-ASTCENC_BUILD="${ROOT}/build-astcenc"
-ASTCENC_INSTALL="${ROOT}/astcenc-android"
-
-ANDROID_API="21"
-ANDROID_TARGET="aarch64-linux-android${ANDROID_API}"
-
-###############################################################################
-# Download Android NDK r10e
-###############################################################################
-
-echo
-echo "========================================"
-echo " Android NDK r10e"
-echo "========================================"
-
-if [ ! -d "${ROOT}/${NDK_VERSION}" ]; then
-    if [ ! -f "${NDK_ZIP}" ]; then
-        wget -nv \
-            "https://dl.google.com/android/repository/${NDK_ZIP}" \
-            -O "${NDK_ZIP}"
-    fi
-
-    unzip -q "${NDK_ZIP}"
-fi
-
-export NDK="${ROOT}/${NDK_VERSION}"
-
-if [ ! -d "${NDK}" ]; then
-    echo "ERROR: Android NDK not found:"
-    echo "  ${NDK}"
-    exit 1
-fi
-
-echo "NDK:"
-echo "  ${NDK}"
-
-###############################################################################
-# Download LLVM / Clang 11.1.0
-###############################################################################
-
-echo
-echo "========================================"
-echo " LLVM / Clang ${LLVM_VERSION}"
-echo "========================================"
-
-if [ ! -x "${LLVM_DIR}/bin/clang" ]; then
-
-    if [ ! -f "${LLVM_ARCHIVE}" ]; then
-        wget -nv \
-            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${LLVM_ARCHIVE}" \
-            -O "${LLVM_ARCHIVE}"
-    fi
-
-    rm -rf "${LLVM_DIR}"
-    mkdir -p "${LLVM_DIR}"
-
-    tar -xJf "${LLVM_ARCHIVE}" \
-        --strip-components=1 \
-        -C "${LLVM_DIR}"
-fi
-
-export PATH="${LLVM_DIR}/bin:${PATH}"
-
-CLANG="${LLVM_DIR}/bin/clang"
-CLANGXX="${LLVM_DIR}/bin/clang++"
-LLD="${LLVM_DIR}/bin/ld.lld"
-LLVM_AR="${LLVM_DIR}/bin/llvm-ar"
-LLVM_RANLIB="${LLVM_DIR}/bin/llvm-ranlib"
-
-if [ ! -x "${CLANG}" ]; then
-    echo "ERROR: clang not found:"
-    echo "  ${CLANG}"
-    exit 1
-fi
-
-echo "clang:"
-"${CLANG}" --version | head -n 1
-
-###############################################################################
-# Android r10e toolchain
-###############################################################################
-
-echo
-echo "========================================"
-echo " Android AArch64 toolchain"
-echo "========================================"
-
-ANDROID_SYSROOT="${NDK}/platforms/android-${ANDROID_API}/arch-arm64"
-
-ANDROID_GCC_TOOLCHAIN="${NDK}/toolchains/aarch64-linux-android-4.9/prebuilt/linux-x86_64"
-
-ANDROID_AR="${ANDROID_GCC_TOOLCHAIN}/bin/aarch64-linux-android-ar"
-ANDROID_RANLIB="${ANDROID_GCC_TOOLCHAIN}/bin/aarch64-linux-android-ranlib"
-
-if [ ! -d "${ANDROID_SYSROOT}" ]; then
-    echo "ERROR: Android sysroot not found:"
-    echo "  ${ANDROID_SYSROOT}"
-    exit 1
-fi
-
-if [ ! -d "${ANDROID_GCC_TOOLCHAIN}" ]; then
-    echo "ERROR: Android GCC toolchain not found:"
-    echo "  ${ANDROID_GCC_TOOLCHAIN}"
-    exit 1
-fi
-
-###############################################################################
-# LLVM libc++
-###############################################################################
-
-echo
-echo "========================================"
-echo " LLVM libc++"
-echo "========================================"
-
-LIBCXX_INCLUDE="${LLVM_DIR}/include/c++/v1"
-
-if [ ! -d "${LIBCXX_INCLUDE}" ]; then
-    echo "ERROR: LLVM libc++ headers not found:"
-    echo "  ${LIBCXX_INCLUDE}"
-    exit 1
-fi
-
-echo "libc++:"
-echo "  ${LIBCXX_INCLUDE}"
-
-###############################################################################
-# Clone ASTC Encoder 4.8.0
-###############################################################################
-
-echo
-echo "========================================"
-echo " ASTC Encoder ${ASTCENC_VERSION}"
-echo "========================================"
-
-if [ ! -d "${ASTCENC_DIR}/.git" ]; then
-    git clone \
-        --branch "${ASTCENC_VERSION}" \
-        --depth 1 \
-        https://github.com/ARM-software/astc-encoder.git \
-        "${ASTCENC_DIR}"
-fi
-
-cd "${ROOT}"
-
-echo "ASTC Encoder commit:"
-git -C "${ASTCENC_DIR}" rev-parse HEAD
-
-###############################################################################
-# Build ASTC Encoder for Android AArch64
-###############################################################################
-
-echo
-echo "========================================"
-echo " Build ASTC Encoder"
-echo "========================================"
-
-rm -rf "${ASTCENC_BUILD}"
-rm -rf "${ASTCENC_INSTALL}"
-
-mkdir -p "${ASTCENC_BUILD}"
-mkdir -p "${ASTCENC_INSTALL}/include"
-mkdir -p "${ASTCENC_INSTALL}/lib"
-
-COMMON_FLAGS="\
+ASTC_CFLAGS="\
 --target=${ANDROID_TARGET} \
 --sysroot=${ANDROID_SYSROOT} \
 --gcc-toolchain=${ANDROID_GCC_TOOLCHAIN}"
 
-CFLAGS="${COMMON_FLAGS}"
-
-CXXFLAGS="${COMMON_FLAGS} \
+ASTC_CXXFLAGS="\
+${ASTC_CFLAGS} \
 -isystem${LIBCXX_INCLUDE} \
 -stdlib=libc++"
 
-LDFLAGS="${COMMON_FLAGS} \
+ASTC_LDFLAGS="\
+${ASTC_CFLAGS} \
 -fuse-ld=lld"
 
 cmake \
@@ -201,11 +23,11 @@ cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER="${CLANG}" \
     -DCMAKE_CXX_COMPILER="${CLANGXX}" \
-    -DCMAKE_C_FLAGS="${CFLAGS}" \
-    -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
-    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
-    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS}" \
-    -DCMAKE_MODULE_LINKER_FLAGS="${LDFLAGS}" \
+    -DCMAKE_C_FLAGS="${ASTC_CFLAGS}" \
+    -DCMAKE_CXX_FLAGS="${ASTC_CXXFLAGS}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${ASTC_LDFLAGS}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${ASTC_LDFLAGS}" \
+    -DCMAKE_MODULE_LINKER_FLAGS="${ASTC_LDFLAGS}" \
     -DCMAKE_AR="${LLVM_AR}" \
     -DCMAKE_RANLIB="${LLVM_RANLIB}" \
     -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
@@ -231,81 +53,46 @@ cmake --build "${ASTCENC_BUILD}" \
     --config Release \
     --parallel "$(nproc)"
 
-###############################################################################
-# Install ASTC Encoder files
-###############################################################################
-
-echo
-echo "========================================"
-echo " Install ASTC Encoder"
-echo "========================================"
-
-ASTCENC_HEADER="${ASTCENC_DIR}/Source/astcenc.h"
-
-if [ ! -f "${ASTCENC_HEADER}" ]; then
-    echo "ERROR: ASTCENC header not found:"
-    echo "  ${ASTCENC_HEADER}"
-    exit 1
-fi
-
-cp "${ASTCENC_HEADER}" \
-    "${ASTCENC_INSTALL}/include/astcenc.h"
-
-ASTCENC_LIBRARY="$(find "${ASTCENC_BUILD}" \
-    -type f \
-    -name 'libastcenc-neon-static.a' \
-    -print -quit)"
-
-if [ -z "${ASTCENC_LIBRARY}" ]; then
-    echo "ERROR: ASTCENC static library not found."
-    exit 1
-fi
-
-cp "${ASTCENC_LIBRARY}" \
-    "${ASTCENC_INSTALL}/lib/libastcenc-neon-static.a"
-
-echo
-echo "ASTCENC files:"
-find "${ASTCENC_INSTALL}" -type f -print
 
 ###############################################################################
-# Export ASTCENC_ROOT
-###############################################################################
-
-export ASTCENC_ROOT="${ASTCENC_INSTALL}"
-
-echo
-echo "ASTCENC_ROOT:"
-echo "  ${ASTCENC_ROOT}"
-
-if [ ! -f "${ASTCENC_ROOT}/include/astcenc.h" ]; then
-    echo "ERROR: astcenc.h missing."
-    exit 1
-fi
-
-if [ ! -f "${ASTCENC_ROOT}/lib/libastcenc-neon-static.a" ]; then
-    echo "ERROR: libastcenc-neon-static.a missing."
-    exit 1
-fi
-
-###############################################################################
-# IMPORTANT:
-# GitHub Actions pre-exports a modern Android NDK.
-# Waf must use our downloaded NDK r10e instead.
+# ASTCENC DONE
 ###############################################################################
 
 echo
-echo "========================================"
-echo " Prepare Waf environment"
-echo "========================================"
+echo "ASTCENC build finished."
 
-chmod +x waf
 
-# Remove GitHub Actions / environment-provided modern NDK variables.
-unset ANDROID_NDK
-unset ANDROID_NDK_HOME
-unset ANDROID_NDK_ROOT
-unset ANDROID_NDK_LATEST_HOME
+###############################################################################
+# DESTROY ASTCENC COMPILER ENVIRONMENT
+###############################################################################
+
+unset ASTC_CFLAGS
+unset ASTC_CXXFLAGS
+unset ASTC_LDFLAGS
+
+unset CFLAGS
+unset CXXFLAGS
+unset CPPFLAGS
+unset LDFLAGS
+
+unset CC
+unset CXX
+unset CPP
+unset AR
+unset AS
+unset LD
+unset NM
+unset OBJCOPY
+unset OBJDUMP
+unset RANLIB
+unset STRIP
+unset READELF
+
+unset CMAKE_C_FLAGS
+unset CMAKE_CXX_FLAGS
+unset CMAKE_EXE_LINKER_FLAGS
+unset CMAKE_SHARED_LINKER_FLAGS
+unset CMAKE_MODULE_LINKER_FLAGS
 
 unset CMAKE_TOOLCHAIN_FILE
 unset CMAKE_ANDROID_NDK
@@ -313,47 +100,39 @@ unset CMAKE_ANDROID_NDK_VERSION
 unset CMAKE_ANDROID_ARCH_ABI
 unset CMAKE_ANDROID_API
 
-# Force Waf to use Android NDK r10e.
-export ANDROID_NDK="${NDK}"
-export ANDROID_NDK_HOME="${NDK}"
-export ANDROID_NDK_ROOT="${NDK}"
-
-# Also expose the old NDK name in case the Waf script checks NDK_HOME.
-export NDK_HOME="${NDK}"
-
-# Make sure our LLVM comes first.
-export PATH="${LLVM_DIR}/bin:${ANDROID_GCC_TOOLCHAIN}/bin:${PATH}"
-
-echo
-echo "Waf Android environment:"
-echo "  ANDROID_NDK      = ${ANDROID_NDK}"
-echo "  ANDROID_NDK_HOME = ${ANDROID_NDK_HOME}"
-echo "  ANDROID_NDK_ROOT = ${ANDROID_NDK_ROOT}"
-echo "  NDK_HOME         = ${NDK_HOME}"
-echo "  ASTCENC_ROOT     = ${ASTCENC_ROOT}"
-
-if [ "${ANDROID_NDK}" != "${NDK}" ]; then
-    echo
-    echo "ERROR: Waf NDK environment is incorrect."
-    echo "Expected:"
-    echo "  ${NDK}"
-    echo "Got:"
-    echo "  ${ANDROID_NDK}"
-    exit 1
-fi
 
 ###############################################################################
-# Waf build
+# WAF ENVIRONMENT
+#
+# NOTHING FROM ASTCENC IS REUSED HERE.
 ###############################################################################
 
-echo
-echo "========================================"
-echo " Waf configure"
-echo "========================================"
+export ANDROID_NDK="$PWD/android-ndk-r10e/"
+export ANDROID_NDK_HOME="$PWD/android-ndk-r10e/"
+export NDK_HOME="$PWD/android-ndk-r10e/"
+
+chmod +x "$HOME/llvm11/bin/llvm-strip"
+
+export PATH="$HOME/llvm11/bin:$PATH"
+
+###############################################################################
+# WAF ONLY
+###############################################################################
+
+export CC="$HOME/llvm11/bin/clang"
+export CXX="$HOME/llvm11/bin/clang++"
+export AR="$HOME/llvm11/bin/llvm-ar"
+export RANLIB="$HOME/llvm11/bin/llvm-ranlib"
+export STRIP="$HOME/llvm11/bin/llvm-strip"
 
 export CFLAGS="-O2"
 export CXXFLAGS="-O2"
 export LDFLAGS="-s -flto"
+
+
+###############################################################################
+# WAF
+###############################################################################
 
 ./waf configure \
     -T release \
@@ -363,29 +142,5 @@ export LDFLAGS="-s -flto"
     --prefix=./output \
     --disable-warns
 
-echo
-echo "========================================"
-echo " Waf build"
-echo "========================================"
-
 ./waf build
-
-echo
-echo "========================================"
-echo " Waf install"
-echo "========================================"
-
 ./waf install
-
-echo
-echo "========================================"
-echo " BUILD SUCCESS"
-echo "========================================"
-
-echo "Output:"
-echo "  ${ROOT}/output"
-
-echo
-echo "ASTCENC:"
-echo "  ${ASTCENC_ROOT}/include/astcenc.h"
-echo "  ${ASTCENC_ROOT}/lib/libastcenc-neon-static.a"
