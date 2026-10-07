@@ -77,8 +77,6 @@ if [ ! -x "${LLVM_DIR}/bin/clang" ]; then
         -C "${LLVM_DIR}"
 fi
 
-export PATH="${LLVM_DIR}/bin:${PATH}"
-
 CLANG="${LLVM_DIR}/bin/clang"
 CLANGXX="${LLVM_DIR}/bin/clang++"
 LLD="${LLVM_DIR}/bin/ld.lld"
@@ -123,24 +121,28 @@ if [ ! -d "${ANDROID_GCC_TOOLCHAIN}" ]; then
 fi
 
 ###############################################################################
-# LLVM libc++
+# ASTCENC libc++
+#
+# IMPORTANT:
+# This libc++ is ONLY for ASTCENC.
+# It is deliberately NOT exported to Waf.
 ###############################################################################
 
 echo
 echo "========================================"
-echo " LLVM libc++"
+echo " LLVM libc++ for ASTCENC"
 echo "========================================"
 
-LIBCXX_INCLUDE="${LLVM_DIR}/include/c++/v1"
+ASTC_LIBCXX_INCLUDE="${LLVM_DIR}/include/c++/v1"
 
-if [ ! -d "${LIBCXX_INCLUDE}" ]; then
+if [ ! -d "${ASTC_LIBCXX_INCLUDE}" ]; then
     echo "ERROR: LLVM libc++ headers not found:"
-    echo "  ${LIBCXX_INCLUDE}"
+    echo "  ${ASTC_LIBCXX_INCLUDE}"
     exit 1
 fi
 
-echo "libc++:"
-echo "  ${LIBCXX_INCLUDE}"
+echo "ASTCENC libc++:"
+echo "  ${ASTC_LIBCXX_INCLUDE}"
 
 ###############################################################################
 # Clone ASTC Encoder 4.8.0
@@ -180,6 +182,9 @@ mkdir -p "${ASTCENC_BUILD}"
 mkdir -p "${ASTCENC_INSTALL}/include"
 mkdir -p "${ASTCENC_INSTALL}/lib"
 
+# IMPORTANT:
+# These variables are shell-local and are NOT exported.
+# Therefore they cannot leak into Waf.
 ASTC_COMMON_FLAGS="\
 --target=${ANDROID_TARGET} \
 --sysroot=${ANDROID_SYSROOT} \
@@ -188,7 +193,7 @@ ASTC_COMMON_FLAGS="\
 ASTC_CFLAGS="${ASTC_COMMON_FLAGS}"
 
 ASTC_CXXFLAGS="${ASTC_COMMON_FLAGS} \
--isystem${LIBCXX_INCLUDE} \
+-isystem${ASTC_LIBCXX_INCLUDE} \
 -stdlib=libc++"
 
 ASTC_LDFLAGS="${ASTC_COMMON_FLAGS} \
@@ -290,10 +295,9 @@ fi
 
 ###############################################################################
 # IMPORTANT:
-# ASTCENC is completely finished.
+# ASTCENC compiler environment ENDS HERE.
 #
-# Keep ASTCENC_ROOT.
-# Reset compiler environment before Waf.
+# Nothing from ASTCENC's compiler flags is allowed to leak into Waf.
 ###############################################################################
 
 echo
@@ -301,30 +305,25 @@ echo "========================================"
 echo " Reset compiler environment"
 echo "========================================"
 
-unset ASTC_COMMON_FLAGS
-unset ASTC_CFLAGS
-unset ASTC_CXXFLAGS
-unset ASTC_LDFLAGS
-
 unset CC
 unset CXX
 unset CPP
+unset AR
+unset AS
+unset LD
+unset RANLIB
+unset STRIP
+unset OBJC
+unset OBJCXX
 
 unset CFLAGS
 unset CXXFLAGS
 unset CPPFLAGS
 unset LDFLAGS
 
-unset AR
-unset AS
-unset LD
-unset NM
-unset OBJCOPY
-unset OBJDUMP
-unset RANLIB
-unset STRIP
-unset READELF
-
+unset SYSROOT
+unset CMAKE_C_COMPILER
+unset CMAKE_CXX_COMPILER
 unset CMAKE_C_FLAGS
 unset CMAKE_CXX_FLAGS
 unset CMAKE_EXE_LINKER_FLAGS
@@ -337,31 +336,12 @@ unset CMAKE_ANDROID_NDK_VERSION
 unset CMAKE_ANDROID_ARCH_ABI
 unset CMAKE_ANDROID_API
 
-unset ANDROID_NDK
-unset ANDROID_NDK_HOME
-unset ANDROID_NDK_ROOT
-unset ANDROID_NDK_LATEST_HOME
-unset NDK_HOME
-unset CC
-unset CXX
-unset AR
-unset RANLIB
-unset CFLAGS
-unset CXXFLAGS
-unset CPPFLAGS
-unset LDFLAGS
-
-export ANDROID_NDK="${ROOT}/android-ndk-r10e"
-export ANDROID_NDK_HOME="${ANDROID_NDK}"
-export NDK_HOME="${ANDROID_NDK}"
-
-export PATH="$HOME/llvm11/bin:$PATH"
-
-export CFLAGS="-O2"
-export CXXFLAGS="-O2 -stdlib=libc++ -isystem$HOME/llvm11/include/c++/v1"
-export LDFLAGS="-s -flto"
 ###############################################################################
 # Waf environment
+#
+# IMPORTANT:
+# Waf uses Android NDK r10e libc++.
+# Do NOT use LLVM_DIR/include/c++/v1 here.
 ###############################################################################
 
 echo
@@ -371,45 +351,107 @@ echo "========================================"
 
 chmod +x waf
 
-export ANDROID_NDK="$PWD/android-ndk-r10e/"
-export ANDROID_NDK_HOME="$PWD/android-ndk-r10e/"
-export NDK_HOME="$PWD/android-ndk-r10e/"
+# Remove GitHub Actions / externally supplied modern NDK variables.
+unset ANDROID_NDK
+unset ANDROID_NDK_HOME
+unset ANDROID_NDK_ROOT
+unset ANDROID_NDK_LATEST_HOME
 
-chmod +x "$HOME/llvm11/bin/llvm-strip"
-
-export PATH="$HOME/llvm11/bin:$PATH"
-
-###############################################################################
-# Waf compiler
-###############################################################################
-
-export CC="$HOME/llvm11/bin/clang"
-export CXX="$HOME/llvm11/bin/clang++"
-
-export AR="$HOME/llvm11/bin/llvm-ar"
-export RANLIB="$HOME/llvm11/bin/llvm-ranlib"
-export STRIP="$HOME/llvm11/bin/llvm-strip"
-export LD="$HOME/llvm11/bin/ld.lld"
+# Waf must use our downloaded NDK r10e.
+export ANDROID_NDK="${NDK}"
+export ANDROID_NDK_HOME="${NDK}"
+export ANDROID_NDK_ROOT="${NDK}"
+export NDK_HOME="${NDK}"
 
 ###############################################################################
-# Waf-only flags
+# NDK r10e libc++
 ###############################################################################
 
-export CFLAGS="-O2"
-export CXXFLAGS="-O2"
+WAF_LIBCXX_INCLUDE="${NDK}/sources/cxx-stl/llvm-libc++/libcxx/include"
+WAF_LIBCXXABI_INCLUDE="${NDK}/sources/cxx-stl/llvm-libc++abi/libcxxabi/include"
+WAF_ANDROID_SUPPORT_INCLUDE="${NDK}/sources/android/support/include"
+
+if [ ! -d "${WAF_LIBCXX_INCLUDE}" ]; then
+    echo "ERROR: NDK r10e libc++ headers not found:"
+    echo "  ${WAF_LIBCXX_INCLUDE}"
+    exit 1
+fi
+
+if [ ! -d "${WAF_LIBCXXABI_INCLUDE}" ]; then
+    echo "ERROR: NDK r10e libc++abi headers not found:"
+    echo "  ${WAF_LIBCXXABI_INCLUDE}"
+    exit 1
+fi
+
+if [ ! -d "${WAF_ANDROID_SUPPORT_INCLUDE}" ]; then
+    echo "ERROR: Android support headers not found:"
+    echo "  ${WAF_ANDROID_SUPPORT_INCLUDE}"
+    exit 1
+fi
+
+###############################################################################
+# Waf compiler tools
+###############################################################################
+
+# Keep LLVM 11 first.
+export PATH="${LLVM_DIR}/bin:${PATH}"
+
+# Make llvm-strip executable as requested.
+chmod +x "${LLVM_DIR}/bin/llvm-strip"
+
+###############################################################################
+# Waf C/C++ flags
+#
+# These are Waf-only flags.
+# They are created AFTER the ASTCENC environment was completely reset.
+#
+# The critical part for the '<new>' error is the NDK r10e libc++ include.
+###############################################################################
+
+export CFLAGS="-O2 \
+-isystem${WAF_ANDROID_SUPPORT_INCLUDE}"
+
+export CXXFLAGS="-O2 \
+-stdlib=libc++ \
+-isystem${WAF_LIBCXX_INCLUDE} \
+-isystem${WAF_LIBCXXABI_INCLUDE} \
+-isystem${WAF_ANDROID_SUPPORT_INCLUDE}"
+
 export LDFLAGS="-s -flto"
+
+###############################################################################
+# Waf environment information
+###############################################################################
 
 echo
 echo "Waf Android environment:"
 echo "  ANDROID_NDK      = ${ANDROID_NDK}"
 echo "  ANDROID_NDK_HOME = ${ANDROID_NDK_HOME}"
+echo "  ANDROID_NDK_ROOT = ${ANDROID_NDK_ROOT}"
 echo "  NDK_HOME         = ${NDK_HOME}"
 echo "  ASTCENC_ROOT     = ${ASTCENC_ROOT}"
 
 echo
-echo "Compiler:"
-echo "  CC  = ${CC}"
-echo "  CXX = ${CXX}"
+echo "Waf LLVM:"
+echo "  LLVM_DIR         = ${LLVM_DIR}"
+echo "  clang            = ${CLANG}"
+echo "  clang++          = ${CLANGXX}"
+
+echo
+echo "Waf libc++:"
+echo "  libc++           = ${WAF_LIBCXX_INCLUDE}"
+echo "  libc++abi        = ${WAF_LIBCXXABI_INCLUDE}"
+echo "  Android support  = ${WAF_ANDROID_SUPPORT_INCLUDE}"
+
+if [ "${ANDROID_NDK}" != "${NDK}" ]; then
+    echo
+    echo "ERROR: Waf NDK environment is incorrect."
+    echo "Expected:"
+    echo "  ${NDK}"
+    echo "Got:"
+    echo "  ${ANDROID_NDK}"
+    exit 1
+fi
 
 ###############################################################################
 # Waf configure
@@ -451,7 +493,7 @@ echo "========================================"
 ./waf install
 
 ###############################################################################
-# SUCCESS
+# Success
 ###############################################################################
 
 echo
