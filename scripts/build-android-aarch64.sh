@@ -342,7 +342,24 @@ unset ANDROID_NDK_HOME
 unset ANDROID_NDK_ROOT
 unset ANDROID_NDK_LATEST_HOME
 unset NDK_HOME
+unset CC
+unset CXX
+unset AR
+unset RANLIB
+unset CFLAGS
+unset CXXFLAGS
+unset CPPFLAGS
+unset LDFLAGS
 
+export ANDROID_NDK="${ROOT}/android-ndk-r10e"
+export ANDROID_NDK_HOME="${ANDROID_NDK}"
+export NDK_HOME="${ANDROID_NDK}"
+
+export PATH="$HOME/llvm11/bin:$PATH"
+
+export CFLAGS="-O2"
+export CXXFLAGS="-O2 -stdlib=libc++ -isystem$HOME/llvm11/include/c++/v1"
+export LDFLAGS="-s -flto"
 ###############################################################################
 # Waf environment
 ###############################################################################
