@@ -195,6 +195,16 @@ def configure(conf):
 		conf.env.STLIBPATH_LIBCXX = [libcxx_dir]
 		conf.env.STLIB_LIBCXX = ['c++_static']
 		conf.msg('Android libc++ runtime', libcxx_dir)
+        # One STL per module: drop gnustl, libc++ is the only C++ runtime
+		# linked into the Android build.
+		for key in list(conf.env.keys()):
+			val = conf.env[key]
+			if isinstance(val, list):
+				conf.env[key] = [
+					v for v in val
+					if not (isinstance(v, str) and
+						('gnustl' in v or 'gnu-libstdc++' in v))
+				]
 
 
 def build(bld):
