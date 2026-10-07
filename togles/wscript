@@ -16,9 +16,10 @@ def options(opt):
 def configure(conf):
 	conf.define('TOGL_DLL_EXPORT', 1)
 
-	# ASTCENC is mandatory.
-	#
-	# HAVE_ASTCENC is always enabled because ASTC support is required.
+	# ------------------------------------------------------------
+	# Common defines
+	# ------------------------------------------------------------
+
 	conf.env.append_unique('DEFINES', [
 		'strncpy=use_Q_strncpy_instead',
 		'_snprintf=use_Q_snprintf_instead',
@@ -29,12 +30,10 @@ def configure(conf):
 	# ASTCENC
 	# ------------------------------------------------------------
 	#
+	# ASTCENC is mandatory.
+	#
 	# ASTCENC_ROOT must point to an ASTCENC installation built
-	# for the current target platform.
-	#
-	# Example:
-	#
-	#   export ASTCENC_ROOT=/path/to/astcenc-android
+	# for the CURRENT TARGET PLATFORM.
 	#
 	# Expected layout:
 	#
@@ -42,9 +41,10 @@ def configure(conf):
 	#   ├── include/
 	#   │   └── astcenc.h
 	#   └── lib/
-	#       └── libastcenc.a
+	#       └── libastcenc-neon-static.a
 	#
-	# Do NOT use the host Linux libastcenc when building Android.
+	# For Android AArch64 we intentionally use the NEON static
+	# library produced by ASTC Encoder.
 	#
 
 	astcenc_root = os.environ.get('ASTCENC_ROOT')
@@ -72,69 +72,29 @@ def configure(conf):
 		'astcenc.h'
 	)
 
+	astcenc_library = os.path.join(
+		astcenc_lib,
+		'libastcenc-neon-static.a'
+	)
+
 	# ------------------------------------------------------------
-	# Check ASTCENC header
+	# Verify ASTCENC files
 	# ------------------------------------------------------------
 
 	if not os.path.isfile(astcenc_header):
 		conf.fatal(
-			'ASTCENC header not found:\n  %s\n'
-			'ASTCENC_ROOT=%s' %
-			(astcenc_header, astcenc_root)
+			'ASTCENC header not found:\n'
+			'  %s\n'
+			'ASTCENC_ROOT=%s'
+			% (astcenc_header, astcenc_root)
 		)
 
-	# ------------------------------------------------------------
-	# Find ASTCENC library
-	# ------------------------------------------------------------
-
-	astcenc_library = None
-	astcenc_library_name = None
-
-	# Normal static library name.
-	candidates = [
-		'libastcenc.a',
-
-		# Some ASTCENC builds may use a NEON-specific name.
-		'libastcenc-neon-static.a',
-
-		# Also allow shared library builds.
-		'libastcenc.so',
-		'libastcenc.dylib',
-	]
-
-	for filename in candidates:
-		path = os.path.join(
-			astcenc_lib,
-			filename
-		)
-
-		if os.path.isfile(path):
-			astcenc_library = path
-
-			# Waf library name without lib prefix / extension.
-			astcenc_library_name = filename
-
-			if astcenc_library_name.startswith('lib'):
-				astcenc_library_name = astcenc_library_name[3:]
-
-			if astcenc_library_name.endswith('.a'):
-				astcenc_library_name = astcenc_library_name[:-2]
-			elif astcenc_library_name.endswith('.so'):
-				astcenc_library_name = astcenc_library_name[:-3]
-			elif astcenc_library_name.endswith('.dylib'):
-				astcenc_library_name = astcenc_library_name[:-6]
-
-			break
-
-	if astcenc_library is None:
+	if not os.path.isfile(astcenc_library):
 		conf.fatal(
-			'ASTCENC library not found in:\n  %s\n'
-			'Expected one of:\n'
-			'  libastcenc.a\n'
-			'  libastcenc-neon-static.a\n'
-			'  libastcenc.so\n'
-			'  libastcenc.dylib' %
-			astcenc_lib
+			'ASTCENC library not found:\n'
+			'  %s\n'
+			'ASTCENC_ROOT=%s'
+			% (astcenc_library, astcenc_root)
 		)
 
 	# ------------------------------------------------------------
@@ -149,31 +109,57 @@ def configure(conf):
 		astcenc_lib
 	]
 
+	# IMPORTANT:
+	#
+	# Waf expects the library name WITHOUT:
+	#
+	#   lib
+	#   .a
+	#
+	# Therefore:
+	#
+	#   libastcenc-neon-static.a
+	#
+	# becomes:
+	#
+	#   astcenc-neon-static
+	#
+
 	conf.env.LIB_ASTCENC = [
-		astcenc_library_name
+		'astcenc-neon-static'
 	]
 
 	# ------------------------------------------------------------
-	# Verify the header with the actual compiler
+	# Verify ASTCENC header with the actual target compiler
 	# ------------------------------------------------------------
+	#
+	# Do not use check_cc(lib=...) here.
+	#
+	# We already verified the exact archive above and manually
+	# provide the library to the target through LIB_ASTCENC.
+	#
+	# The header check is still useful because it verifies that
+	# the target compiler can actually include astcenc.h.
+	#
 
 	conf.check_cc(
 		header_name='astcenc.h',
-		includes=astcenc_include,
-		uselib_store='ASTCENC',
+		includes=conf.env.INCLUDES_ASTCENC,
 		mandatory=True
 	)
 
 	# ------------------------------------------------------------
-	# Verify the actual ASTCENC library
+	# ASTCENC information
 	# ------------------------------------------------------------
 
-	conf.check_cc(
-		lib=astcenc_library_name,
-		libpath=astcenc_lib,
-		includes=astcenc_include,
-		uselib_store='ASTCENC',
-		mandatory=True
+	conf.msg(
+		'ASTCENC include',
+		astcenc_include
+	)
+
+	conf.msg(
+		'ASTCENC library',
+		astcenc_library
 	)
 
 
@@ -208,20 +194,26 @@ def build(bld):
 		'.',
 		'../public',
 		'../public/tier0',
-		'../public/tier1'
+		'../public/tier1',
 	] + bld.env.INCLUDES_SDL2
+
+	# ------------------------------------------------------------
+	# Defines
+	# ------------------------------------------------------------
 
 	defines = [
 		'HAVE_ASTCENC=1',
 	]
 
+	# ------------------------------------------------------------
+	# Libraries
+	# ------------------------------------------------------------
+	#
 	# ASTCENC is REQUIRED.
 	#
-	# configure() has already verified:
-	#   - astcenc.h
-	#   - ASTCENC library
+	# Never make ASTCENC conditional.
 	#
-	# Therefore this must NEVER be conditional.
+
 	libs = [
 		'tier0',
 		'tier1',
@@ -236,6 +228,10 @@ def build(bld):
 			'OPENGL',
 			'CARBON',
 		]
+
+	# ------------------------------------------------------------
+	# Build
+	# ------------------------------------------------------------
 
 	install_path = bld.env.LIBDIR
 
