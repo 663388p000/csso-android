@@ -1,391 +1,302 @@
-#!/bin/sh
-set -eu
-
-###############################################################################
-# Paths / versions
-###############################################################################
-
-ROOT="$(pwd)"
-
-NDK_VERSION="android-ndk-r10e"
-NDK_ZIP="${NDK_VERSION}-linux-x86_64.zip"
-
-LLVM_VERSION="11.1.0"
-LLVM_ARCHIVE="clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-16.04.tar.xz"
-LLVM_DIR="${HOME}/llvm11"
-
-ASTCENC_VERSION="4.8.0"
-ASTCENC_DIR="${ROOT}/astc-encoder"
-ASTCENC_BUILD="${ROOT}/build-astcenc"
-ASTCENC_INSTALL="${ROOT}/astcenc-android"
-
-ANDROID_API="21"
-ANDROID_TARGET="aarch64-linux-android${ANDROID_API}"
-
-###############################################################################
-# Download Android NDK r10e
-###############################################################################
-
-echo
-echo "========================================"
-echo " Android NDK r10e"
-echo "========================================"
-
-if [ ! -d "${ROOT}/${NDK_VERSION}" ]; then
-    if [ ! -f "${NDK_ZIP}" ]; then
-        wget -nv \
-            "https://dl.google.com/android/repository/${NDK_ZIP}" \
-            -O "${NDK_ZIP}"
-    fi
-
-    unzip -q "${NDK_ZIP}"
-fi
-
-export NDK="${ROOT}/${NDK_VERSION}"
-
-if [ ! -d "${NDK}" ]; then
-    echo "ERROR: Android NDK not found:"
-    echo "  ${NDK}"
-    exit 1
-fi
-
-echo "NDK:"
-echo "  ${NDK}"
-
-###############################################################################
-# Download LLVM / Clang 11.1.0
-###############################################################################
-
-echo
-echo "========================================"
-echo " LLVM / Clang ${LLVM_VERSION}"
-echo "========================================"
-
-if [ ! -x "${LLVM_DIR}/bin/clang" ]; then
-
-    if [ ! -f "${LLVM_ARCHIVE}" ]; then
-        wget -nv \
-            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${LLVM_ARCHIVE}" \
-            -O "${LLVM_ARCHIVE}"
-    fi
-
-    rm -rf "${LLVM_DIR}"
-    mkdir -p "${LLVM_DIR}"
-
-    tar -xJf "${LLVM_ARCHIVE}" \
-        --strip-components=1 \
-        -C "${LLVM_DIR}"
-fi
-
-export PATH="${LLVM_DIR}/bin:${PATH}"
-
-CLANG="${LLVM_DIR}/bin/clang"
-CLANGXX="${LLVM_DIR}/bin/clang++"
-LLD="${LLVM_DIR}/bin/ld.lld"
-LLVM_AR="${LLVM_DIR}/bin/llvm-ar"
-LLVM_RANLIB="${LLVM_DIR}/bin/llvm-ranlib"
-
-if [ ! -x "${CLANG}" ]; then
-    echo "ERROR: clang not found:"
-    echo "  ${CLANG}"
-    exit 1
-fi
-
-echo "clang:"
-"${CLANG}" --version | head -n 1
-
-###############################################################################
-# Android r10e toolchain
-###############################################################################
-
-echo
-echo "========================================"
-echo " Android AArch64 toolchain"
-echo "========================================"
-
-ANDROID_SYSROOT="${NDK}/platforms/android-${ANDROID_API}/arch-arm64"
-
-ANDROID_GCC_TOOLCHAIN="${NDK}/toolchains/aarch64-linux-android-4.9/prebuilt/linux-x86_64"
-
-ANDROID_AR="${ANDROID_GCC_TOOLCHAIN}/bin/aarch64-linux-android-ar"
-ANDROID_RANLIB="${ANDROID_GCC_TOOLCHAIN}/bin/aarch64-linux-android-ranlib"
-
-if [ ! -d "${ANDROID_SYSROOT}" ]; then
-    echo "ERROR: Android sysroot not found:"
-    echo "  ${ANDROID_SYSROOT}"
-    exit 1
-fi
-
-if [ ! -d "${ANDROID_GCC_TOOLCHAIN}" ]; then
-    echo "ERROR: Android GCC toolchain not found:"
-    echo "  ${ANDROID_GCC_TOOLCHAIN}"
-    exit 1
-fi
-
-###############################################################################
-# LLVM libc++
-###############################################################################
-
-echo
-echo "========================================"
-echo " LLVM libc++"
-echo "========================================"
-
-LIBCXX_INCLUDE="${LLVM_DIR}/include/c++/v1"
-
-if [ ! -d "${LIBCXX_INCLUDE}" ]; then
-    echo "ERROR: LLVM libc++ headers not found:"
-    echo "  ${LIBCXX_INCLUDE}"
-    exit 1
-fi
-
-echo "libc++:"
-echo "  ${LIBCXX_INCLUDE}"
-
-###############################################################################
-# Clone ASTC Encoder 4.8.0
-###############################################################################
-
-echo
-echo "========================================"
-echo " ASTC Encoder ${ASTCENC_VERSION}"
-echo "========================================"
-
-if [ ! -d "${ASTCENC_DIR}/.git" ]; then
-    git clone \
-        --branch "${ASTCENC_VERSION}" \
-        --depth 1 \
-        https://github.com/ARM-software/astc-encoder.git \
-        "${ASTCENC_DIR}"
-fi
-
-cd "${ROOT}"
-
-echo "ASTC Encoder commit:"
-git -C "${ASTCENC_DIR}" rev-parse HEAD
-
-###############################################################################
-# Build ASTC Encoder for Android AArch64
-###############################################################################
-
-echo
-echo "========================================"
-echo " Build ASTC Encoder"
-echo "========================================"
-
-rm -rf "${ASTCENC_BUILD}"
-rm -rf "${ASTCENC_INSTALL}"
-
-mkdir -p "${ASTCENC_BUILD}"
-mkdir -p "${ASTCENC_INSTALL}/include"
-mkdir -p "${ASTCENC_INSTALL}/lib"
-
-COMMON_FLAGS="\
---target=${ANDROID_TARGET} \
---sysroot=${ANDROID_SYSROOT} \
---gcc-toolchain=${ANDROID_GCC_TOOLCHAIN}"
-
-CFLAGS="${COMMON_FLAGS}"
-
-CXXFLAGS="${COMMON_FLAGS} \
--isystem${LIBCXX_INCLUDE} \
--stdlib=libc++"
-
-LDFLAGS="${COMMON_FLAGS} \
--fuse-ld=lld"
-
-cmake \
-    -S "${ASTCENC_DIR}" \
-    -B "${ASTCENC_BUILD}" \
-    -G "Unix Makefiles" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER="${CLANG}" \
-    -DCMAKE_CXX_COMPILER="${CLANGXX}" \
-    -DCMAKE_C_FLAGS="${CFLAGS}" \
-    -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
-    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
-    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS}" \
-    -DCMAKE_MODULE_LINKER_FLAGS="${LDFLAGS}" \
-    -DCMAKE_AR="${LLVM_AR}" \
-    -DCMAKE_RANLIB="${LLVM_RANLIB}" \
-    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
-    -DCMAKE_CXX_STANDARD=11 \
-    -DCMAKE_CXX_STANDARD_REQUIRED=ON \
-    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DASTCENC_ISA_AVX2=OFF \
-    -DASTCENC_ISA_SSE41=OFF \
-    -DASTCENC_ISA_SSE2=OFF \
-    -DASTCENC_ISA_NEON=ON \
-    -DASTCENC_ISA_NONE=OFF \
-    -DASTCENC_ISA_NATIVE=OFF \
-    -DASTCENC_SHAREDLIB=OFF \
-    -DASTCENC_DECOMPRESSOR=OFF \
-    -DASTCENC_DIAGNOSTICS=OFF \
-    -DASTCENC_ASAN=OFF \
-    -DASTCENC_UBSAN=OFF \
-    -DASTCENC_UNITTEST=OFF \
-    -DASTCENC_CLI=OFF
-
-cmake --build "${ASTCENC_BUILD}" \
-    --target astcenc-neon-static \
-    --config Release \
-    --parallel "$(nproc)"
-
-###############################################################################
-# Install ASTC Encoder files
-###############################################################################
-
-echo
-echo "========================================"
-echo " Install ASTC Encoder"
-echo "========================================"
-
-ASTCENC_HEADER="${ASTCENC_DIR}/Source/astcenc.h"
-
-if [ ! -f "${ASTCENC_HEADER}" ]; then
-    echo "ERROR: ASTCENC header not found:"
-    echo "  ${ASTCENC_HEADER}"
-    exit 1
-fi
-
-cp "${ASTCENC_HEADER}" \
-    "${ASTCENC_INSTALL}/include/astcenc.h"
-
-ASTCENC_LIBRARY="$(find "${ASTCENC_BUILD}" \
-    -type f \
-    -name 'libastcenc-neon-static.a' \
-    -print -quit)"
-
-if [ -z "${ASTCENC_LIBRARY}" ]; then
-    echo "ERROR: ASTCENC static library not found."
-    exit 1
-fi
-
-cp "${ASTCENC_LIBRARY}" \
-    "${ASTCENC_INSTALL}/lib/libastcenc-neon-static.a"
-
-echo
-echo "ASTCENC files:"
-find "${ASTCENC_INSTALL}" -type f -print
-
-###############################################################################
-# Export ASTCENC_ROOT
-###############################################################################
-
-export ASTCENC_ROOT="${ASTCENC_INSTALL}"
-
-echo
-echo "ASTCENC_ROOT:"
-echo "  ${ASTCENC_ROOT}"
-
-if [ ! -f "${ASTCENC_ROOT}/include/astcenc.h" ]; then
-    echo "ERROR: astcenc.h missing."
-    exit 1
-fi
-
-if [ ! -f "${ASTCENC_ROOT}/lib/libastcenc-neon-static.a" ]; then
-    echo "ERROR: libastcenc-neon-static.a missing."
-    exit 1
-fi
-
-###############################################################################
-# IMPORTANT:
-# GitHub Actions pre-exports a modern Android NDK.
-# Waf must use our downloaded NDK r10e instead.
-###############################################################################
-
-echo
-echo "========================================"
-echo " Prepare Waf environment"
-echo "========================================"
-
-chmod +x waf
-
-# Remove GitHub Actions / environment-provided modern NDK variables.
-unset ANDROID_NDK
-unset ANDROID_NDK_HOME
-unset ANDROID_NDK_ROOT
-unset ANDROID_NDK_LATEST_HOME
-
-unset CMAKE_TOOLCHAIN_FILE
-unset CMAKE_ANDROID_NDK
-unset CMAKE_ANDROID_NDK_VERSION
-unset CMAKE_ANDROID_ARCH_ABI
-unset CMAKE_ANDROID_API
-
-# Force Waf to use Android NDK r10e.
-export ANDROID_NDK="${NDK}"
-export ANDROID_NDK_HOME="${NDK}"
-export ANDROID_NDK_ROOT="${NDK}"
-
-# Also expose the old NDK name in case the Waf script checks NDK_HOME.
-export NDK_HOME="${NDK}"
-
-# Make sure our LLVM comes first.
-export PATH="${LLVM_DIR}/bin:${ANDROID_GCC_TOOLCHAIN}/bin:${PATH}"
-
-echo
-echo "Waf Android environment:"
-echo "  ANDROID_NDK      = ${ANDROID_NDK}"
-echo "  ANDROID_NDK_HOME = ${ANDROID_NDK_HOME}"
-echo "  ANDROID_NDK_ROOT = ${ANDROID_NDK_ROOT}"
-echo "  NDK_HOME         = ${NDK_HOME}"
-echo "  ASTCENC_ROOT     = ${ASTCENC_ROOT}"
-
-if [ "${ANDROID_NDK}" != "${NDK}" ]; then
-    echo
-    echo "ERROR: Waf NDK environment is incorrect."
-    echo "Expected:"
-    echo "  ${NDK}"
-    echo "Got:"
-    echo "  ${ANDROID_NDK}"
-    exit 1
-fi
-
-###############################################################################
-# Waf build
-###############################################################################
-
-echo
-echo "========================================"
-echo " Waf configure"
-echo "========================================"
-
-export CFLAGS="-O2"
-export CXXFLAGS="-O2"
-export LDFLAGS="-s -flto"
-
-./waf configure \
-    -T release \
-    --build-games=csso \
-    --togles \
-    --android=aarch64,host,21 \
-    --prefix=./output \
-    --disable-warns
-
-echo
-echo "========================================"
-echo " Waf build"
-echo "========================================"
-
-./waf build
-
-echo
-echo "========================================"
-echo " Waf install"
-echo "========================================"
-
-./waf install
-
-echo
-echo "========================================"
-echo " BUILD SUCCESS"
-echo "========================================"
-
-echo "Output:"
-echo "  ${ROOT}/output"
-
-echo
-echo "ASTCENC:"
-echo "  ${ASTCENC_ROOT}/include/astcenc.h"
-echo "  ${ASTCENC_ROOT}/lib/libastcenc-neon-static.a"
+#! /usr/bin/env python
+# encoding: utf-8
+
+from waflib import Utils
+import os
+
+top = '.'
+PROJECT_NAME = 'togl'
+
+
+def options(opt):
+	# stub
+	return
+
+
+def configure(conf):
+	conf.define('TOGL_DLL_EXPORT', 1)
+
+	# ------------------------------------------------------------
+	# Common defines
+	# ------------------------------------------------------------
+
+	conf.env.append_unique('DEFINES', [
+		'strncpy=use_Q_strncpy_instead',
+		'_snprintf=use_Q_snprintf_instead',
+		'HAVE_ASTCENC=1',
+	])
+
+	# ------------------------------------------------------------
+	# ASTCENC
+	# ------------------------------------------------------------
+	#
+	# ASTCENC is mandatory.
+	#
+	# ASTCENC_ROOT must point to an ASTCENC installation built
+	# for the CURRENT TARGET PLATFORM.
+	#
+	# Expected layout:
+	#
+	#   astcenc-android/
+	#   ├── include/
+	#   │   └── astcenc.h
+	#   └── lib/
+	#       └── libastcenc-neon-static.a
+	#
+	# For Android AArch64 we use the NEON static library.
+	#
+
+	astcenc_root = os.environ.get('ASTCENC_ROOT')
+
+	if not astcenc_root:
+		conf.fatal(
+			'ASTCENC_ROOT is required. '
+			'ASTCENC must be built for the target platform.'
+		)
+
+	astcenc_root = os.path.abspath(astcenc_root)
+
+	astcenc_include = os.path.join(
+		astcenc_root,
+		'include'
+	)
+
+	astcenc_lib = os.path.join(
+		astcenc_root,
+		'lib'
+	)
+
+	astcenc_header = os.path.join(
+		astcenc_include,
+		'astcenc.h'
+	)
+
+	astcenc_library = os.path.join(
+		astcenc_lib,
+		'libastcenc-neon-static.a'
+	)
+
+	# ------------------------------------------------------------
+	# Verify ASTCENC installation
+	# ------------------------------------------------------------
+	#
+	# Do this directly instead of using check_cc().
+	#
+	# The ASTCENC library has already been built for the target
+	# platform by the CI script, so another compiler probe here
+	# is unnecessary and causes problems with this old Waf setup.
+	#
+
+	if not os.path.isdir(astcenc_include):
+		conf.fatal(
+			'ASTCENC include directory not found:\n'
+			'  %s'
+			% astcenc_include
+		)
+
+	if not os.path.isdir(astcenc_lib):
+		conf.fatal(
+			'ASTCENC library directory not found:\n'
+			'  %s'
+			% astcenc_lib
+		)
+
+	if not os.path.isfile(astcenc_header):
+		conf.fatal(
+			'ASTCENC header not found:\n'
+			'  %s\n'
+			'ASTCENC_ROOT=%s'
+			% (astcenc_header, astcenc_root)
+		)
+
+	if not os.path.isfile(astcenc_library):
+		conf.fatal(
+			'ASTCENC library not found:\n'
+			'  %s\n'
+			'ASTCENC_ROOT=%s'
+			% (astcenc_library, astcenc_root)
+		)
+
+	# ------------------------------------------------------------
+	# Tell Waf where ASTCENC lives
+	# ------------------------------------------------------------
+
+	conf.env.INCLUDES_ASTCENC = [
+		astcenc_include
+	]
+
+	conf.env.LIBPATH_ASTCENC = [
+		astcenc_lib
+	]
+
+	# Waf library name:
+	#
+	#   libastcenc-neon-static.a
+	#
+	# becomes:
+	#
+	#   astcenc-neon-static
+	#
+
+	conf.env.LIB_ASTCENC = [
+		'astcenc-neon-static'
+	]
+
+	# ------------------------------------------------------------
+	# Print ASTCENC configuration
+	# ------------------------------------------------------------
+
+	conf.msg(
+		'ASTCENC include',
+		astcenc_include
+	)
+
+	conf.msg(
+		'ASTCENC library',
+		astcenc_library
+	)
+
+	conf.msg(
+		'ASTCENC support',
+		'enabled'
+	)
+
+	# ------------------------------------------------------------
+	# Android: libc++ runtime
+	# ------------------------------------------------------------
+	#
+	# On Android targets clang compiles against libc++ headers (std::__1),
+	# both for this module and for the prebuilt astcenc archive. The link
+	# line, however, uses -stdlib=libstdc++, so the out-of-line libc++
+	# symbols (std::__1::mutex, condition_variable, thread,
+	# bad_function_call, RTTI vtables ...) are never linked and libtogl.so
+	# fails with "undefined symbol: std::__1::mutex::lock()".
+	#
+	# Link the NDK's static libc++ explicitly. It also carries the C++ ABI
+	# bits (gabi++), which fixes the runtime dlopen error about
+	# _ZTVN10__cxxabiv117__class_type_infoE.
+
+	if conf.env.DEST_OS == 'android':
+		ndk = (os.environ.get('ANDROID_NDK')
+			or os.environ.get('ANDROID_NDK_HOME')
+			or os.environ.get('NDK_HOME'))
+
+		if not ndk:
+			conf.fatal('ANDROID_NDK is required to locate libc++_static.a')
+
+		libcxx_dir = os.path.join(
+			ndk,
+			'sources', 'cxx-stl', 'llvm-libc++', 'libs', 'arm64-v8a'
+		)
+
+		if not os.path.isfile(os.path.join(libcxx_dir, 'libc++_static.a')):
+			conf.fatal('libc++_static.a not found in %s' % libcxx_dir)
+
+		conf.env.STLIBPATH_LIBCXX = [libcxx_dir]
+		conf.env.STLIB_LIBCXX = ['c++_static']
+		conf.msg('Android libc++ runtime', libcxx_dir)
+
+
+def build(bld):
+	source = [
+		'linuxwin/dx9asmtogl2.cpp',
+		'linuxwin/dxabstract.cpp',
+		'linuxwin/glentrypoints.cpp',
+		'linuxwin/glmgr.cpp',
+		'linuxwin/glmgrbasics.cpp',
+
+		# OSX:
+		# 'linuxwin/intelglmallocworkaround.cpp',
+		# 'linuxwin/mach_override.c',
+
+		'linuxwin/cglmtex.cpp',
+		'linuxwin/cglmfbo.cpp',
+		'linuxwin/cglmprogram.cpp',
+		'linuxwin/cglmbuffer.cpp',
+		'linuxwin/cglmquery.cpp',
+		'linuxwin/asanstubs.cpp',
+		'linuxwin/decompress.c',
+		'linuxwin/astc_texcompress.cpp',
+	]
+
+	if bld.env.DEST_OS == "darwin":
+		source += [
+			'linuxwin/glmgrcocoa.mm'
+		]
+
+	# ------------------------------------------------------------
+	# Include paths
+	# ------------------------------------------------------------
+
+	includes = [
+		'.',
+		'../public',
+		'../public/tier0',
+		'../public/tier1',
+	]
+
+	includes += bld.env.INCLUDES_SDL2
+
+	# ASTCENC is mandatory.
+	#
+	# Add it explicitly instead of relying on uselib propagation.
+	#
+
+	includes += bld.env.INCLUDES_ASTCENC
+
+	# ------------------------------------------------------------
+	# Defines
+	# ------------------------------------------------------------
+
+	defines = [
+		'HAVE_ASTCENC=1',
+	]
+
+	# ------------------------------------------------------------
+	# Libraries
+	# ------------------------------------------------------------
+	#
+	# ASTCENC is REQUIRED.
+	#
+	# NEVER make this conditional.
+	#
+
+	libs = [
+		'tier0',
+		'tier1',
+		'tier2',
+		'vstdlib',
+		'mathlib',
+		'ASTCENC',
+	]
+
+	# Must come after ASTCENC: the static archive resolves its libc++ refs.
+	if bld.env.DEST_OS == "android":
+		libs += [
+			'LIBCXX',
+		]
+
+	if bld.env.DEST_OS == "darwin":
+		libs += [
+			'OPENGL',
+			'CARBON',
+		]
+
+	# ------------------------------------------------------------
+	# Build
+	# ------------------------------------------------------------
+
+	install_path = bld.env.LIBDIR
+
+	bld.shlib(
+		source=source,
+		target=PROJECT_NAME,
+		name=PROJECT_NAME,
+		features='c cxx',
+		includes=includes,
+		defines=defines,
+		use=libs,
+		install_path=install_path,
+		subsystem=bld.env.MSVC_SUBSYSTEM,
+		idx=bld.get_taskgen_count()
+	)
