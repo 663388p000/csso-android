@@ -1,4 +1,4 @@
-#!/bin/sh
+۷#!/bin/sh
 set -eu
 
 ###############################################################################
@@ -211,6 +211,7 @@ cmake \
     -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
     -DCMAKE_CXX_STANDARD=11 \
     -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DASTCENC_ISA_AVX2=OFF \
     -DASTCENC_ISA_SSE41=OFF \
     -DASTCENC_ISA_SSE2=OFF \
