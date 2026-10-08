@@ -1,4 +1,4 @@
-//========= ASTC runtime recompression (added on top of Valve TOGL) - v2 =======//
+//========= ASTC runtime recompression (added on top of Valve TOGL) - v3 =======//
 //
 // astc_texcompress.cpp
 //
@@ -156,6 +156,10 @@ ConVar gl_astc_alpha_weight( "gl_astc_alpha_weight", "1", FCVAR_ARCHIVE,
 
 ConVar gl_astc_perceptual( "gl_astc_perceptual", "1", FCVAR_ARCHIVE,
 	"1 = use the perceptual error metric for LDR (8/16-bit) encodes. Matches how the eye judges color error." );
+
+ConVar gl_astc_debug( "gl_astc_debug", "1", FCVAR_ARCHIVE,
+	"0 = off. 1 = check glGetError after every ASTC level upload and log the first failures to the engine log. "
+	"2 = additionally log every ASTC upload and every encoder context creation." );
 
 // ---------------------------------------------------------------------------
 // Format classification
@@ -690,10 +694,17 @@ static unsigned ChooseWorkerCount()
 	return hw > 4 ? 4 : hw;
 }
 
+static EncodePool* CreatePool()
+{
+	const unsigned n = ChooseWorkerCount();
+	Msg( "ASTC: starting encoder thread pool with %u thread(s)\n", n );
+	return new EncodePool( n );
+}
+
 // Intentionally never destroyed: avoids static-destruction-order issues at exit.
 static EncodePool* GetPool()
 {
-	static EncodePool* pool = new EncodePool( ChooseWorkerCount() );
+	static EncodePool* pool = CreatePool();
 	return pool;
 }
 
@@ -745,6 +756,8 @@ static astcenc_context* AcquireSharedContext( astcenc_profile profile, int bw, i
 
 	SharedCtx entry = { profile, bw, bh, qKey, flags, threads, ctx };
 	s_ctxs.push_back( entry );
+	Msg( "ASTC: encoder context #%d ready (profile %d, block %dx%d, quality %.0f, flags 0x%X, %u thread(s))\n",
+		 (int)s_ctxs.size(), (int)profile, bw, bh, quality, (unsigned)flags, threads );
 	return ctx;
 }
 
@@ -957,7 +970,8 @@ bool ASTC_CompressTexture(
 		int blockW,
 		int blockH,
 		int qualityPreset,
-		ASTCEncodeResult* outResult )
+		ASTCEncodeResult* outResult,
+		bool allowDiskCache )
 {
 	if ( outResult )
 		memset( outResult, 0, sizeof( *outResult ) );
@@ -965,6 +979,7 @@ bool ASTC_CompressTexture(
 #if !defined( HAVE_ASTCENC )
 	(void)srcData; (void)width; (void)height; (void)srcGLFormat; (void)srcGLType;
 	(void)isHDR; (void)isSRGB; (void)forceOpaque; (void)blockW; (void)blockH; (void)qualityPreset;
+	(void)allowDiskCache;
 	return false;
 #else
 	if ( !srcData || width <= 0 || height <= 0 || !outResult || !ASTC_IsValidBlockSize( blockW, blockH ) )
@@ -989,7 +1004,7 @@ bool ASTC_CompressTexture(
 		return false;
 
 	// Disk cache lookup. Keyed on the exact source bytes plus every parameter that changes the output.
-	const bool useCache = gl_astc_cache.GetBool() && gl_astc_cache_dir.GetString()[0] != '\0';
+	const bool useCache = allowDiskCache && gl_astc_cache.GetBool() && gl_astc_cache_dir.GetString()[0] != '\0';
 	uint64_t key = 0;
 	if ( useCache )
 	{
@@ -1078,7 +1093,8 @@ void ASTC_CompressTextureRequired(
 		int height,
 		unsigned int srcGLFormat,
 		unsigned int srcGLType,
-		ASTCEncodeResult* outResult )
+		ASTCEncodeResult* outResult,
+		bool allowDiskCache )
 {
 	if ( outResult )
 		memset( outResult, 0, sizeof( *outResult ) );
@@ -1086,14 +1102,22 @@ void ASTC_CompressTextureRequired(
 	int blockW, blockH;
 	ASTC_GetConfiguredBlockSize( isHDR, &blockW, &blockH );
 
-	if ( !ASTC_CompressTexture( srcData, width, height, srcGLFormat, srcGLType,
-								isHDR, isSRGB, forceOpaque, blockW, blockH, gl_astc_quality.GetInt(),
-								outResult ) )
+	if ( ASTC_CompressTexture( srcData, width, height, srcGLFormat, srcGLType,
+							   isHDR, isSRGB, forceOpaque, blockW, blockH, gl_astc_quality.GetInt(),
+							   outResult, allowDiskCache ) )
+		return;
+
+	// v3: this used to be Error(), which killed the whole game on the first texture the encoder
+	// could not handle. The texture must still be ASTC (never uncompressed), so hand back valid
+	// solid-colour ASTC blocks of the right size/format and keep running; the warning tells us
+	// which texture was affected.
+	Warning( "ASTC_CompressTextureRequired: %s ASTC encode failed for a %dx%d texture (block %dx%d, "
+			 "GL format 0x%X type 0x%X). Using a blank ASTC image for it. Is astcenc built in (HAVE_ASTCENC) and linked?\n",
+			 isHDR ? "HDR" : "LDR", width, height, blockW, blockH, srcGLFormat, srcGLType );
+
+	if ( !ASTC_MakeBlankTexture( isHDR, isSRGB, forceOpaque, width, height, outResult ) )
 	{
-		Error( "ASTC_CompressTextureRequired: mandatory %s ASTC compression failed for a %dx%d texture "
-			   "(block %dx%d, GL format 0x%X type 0x%X). Uncompressed upload is disabled; build with "
-			   "HAVE_ASTCENC and link astcenc.\n",
-			   isHDR ? "HDR" : "LDR", width, height, blockW, blockH, srcGLFormat, srcGLType );
+		Error( "ASTC_CompressTextureRequired: out of memory creating a %dx%d ASTC image\n", width, height );
 	}
 }
 
