@@ -34,7 +34,8 @@ extern "C" {
 
 #include "tier0/icommandline.h"
 #include "glmtexinlines.h"
-#include "astc_texcompress.h"		// added: ASTC LDR/HDR runtime recompression for ARGB/RGBA formats
+#include "astc_texcompress.h"
+#include "tier0/dbg.h"		// Warning() / Msg() / Error() for the ASTC upload diagnostics		// added: ASTC LDR/HDR runtime recompression for ARGB/RGBA formats
 
 // memdbgon -must- be the last include file in a .cpp file.
 #include "tier0/memdbgon.h"
@@ -55,6 +56,220 @@ ConVar gl_pow2_tempmem( "gl_pow2_tempmem", "0", FCVAR_INTERNAL_USE,
                         "May help with fragmentation on certain systems caused by heavy churn of large allocations." );
 
 #define TEXSPACE_LOGGING 0
+
+//===============================================================================
+// ASTC runtime-recompression helpers (see astc_texcompress.h)
+//===============================================================================
+
+#ifndef GL_PIXEL_UNPACK_BUFFER_BINDING
+#define GL_PIXEL_UNPACK_BUFFER_BINDING	0x88EF
+#endif
+
+// True when this texture's GPU storage is always ASTC: every non-render-target, non-MSAA texture whose
+// D3D format is ASTC-eligible, plus every DXT texture (decoded to RGBA, then re-encoded as ASTC).
+static inline bool GLMTexIsAstcManaged( const GLMTexLayout *layout )
+{
+	if ( layout->m_key.m_texFlags & ( kGLMTexMultisampled | kGLMTexRenderable ) )
+		return false;
+
+	return ASTC_IsEligibleFormat( (int)layout->m_key.m_texFormat ) || ( layout->m_format->m_chunkSize != 1 );
+}
+
+// Should the CPU copy of the texels outlive Unlock()? An ASTC level can't be patched from the GPU copy
+// (glReadPixels can't read a compressed texture), so a partial update has to be merged into a CPU copy and
+// re-encoded. Dynamic and un-mipped textures (UI, font pages, lightmaps, procedural textures) are the ones
+// that get partial updates, so they keep that shadow copy. Static mipped material textures free it as before.
+static inline bool GLMTexKeepsAstcShadow( const GLMTexLayout *layout )
+{
+	if ( layout->m_key.m_texFlags & ( kGLMTexMultisampled | kGLMTexRenderable ) )
+		return false;
+
+	if ( !ASTC_IsEligibleFormat( (int)layout->m_key.m_texFormat ) )
+		return false;
+
+	return ( layout->m_key.m_texFlags & kGLMTexDynamic ) || !( layout->m_key.m_texFlags & kGLMTexMipped );
+}
+
+static int s_nAstcGLErrorsLogged = 0;
+
+static void GLM_DrainGLErrors()
+{
+	// bounded: a lost context can report an error forever
+	for ( int i = 0; i < 8; ++i )
+	{
+		if ( gGL->glGetError() == GL_NO_ERROR )
+			break;
+	}
+}
+
+// Uploads one ASTC level from CPU memory.
+//
+// With a buffer bound to GL_PIXEL_UNPACK_BUFFER, the 'data' argument of glCompressedTexImage2D is a byte
+// OFFSET into that buffer, not a CPU pointer (and it is GL_INVALID_OPERATION if the buffer is mapped or the
+// offset runs past its end). Dynamic textures leave their PBO bound while WriteTexels runs, so a CPU pointer
+// would be read as a huge bogus offset: the call fails and the level stays undefined, which samples as black.
+// So the PBO binding is always dropped for the upload and restored afterwards.
+static void GLM_UploadAstcLevel2D( GLenum target, GLint level, GLenum internalFormat,
+								   GLsizei width, GLsizei height, GLsizei imageSize, const void *data )
+{
+	GLint prevPBO = 0;
+	gGL->glGetIntegerv( GL_PIXEL_UNPACK_BUFFER_BINDING, &prevPBO );
+	if ( prevPBO != 0 )
+		gGL->glBindBuffer( GL_PIXEL_UNPACK_BUFFER, 0 );
+
+	const int nDebug = gl_astc_debug.GetInt();
+	const bool bCheck = ( nDebug != 0 ) && ( s_nAstcGLErrorsLogged < 64 );
+	if ( bCheck )
+		GLM_DrainGLErrors();
+
+	gGL->glCompressedTexImage2D( target, level, internalFormat, width, height, 0, imageSize, data );
+
+	if ( bCheck )
+	{
+		const GLenum err = (GLenum)gGL->glGetError();
+		if ( err != GL_NO_ERROR )
+		{
+			++s_nAstcGLErrorsLogged;
+			Warning( "ASTC: glCompressedTexImage2D failed, GL error 0x%X (target 0x%X level %d format 0x%X %dx%d, %d bytes, unpack PBO was %d)\n",
+					 (unsigned)err, (unsigned)target, (int)level, (unsigned)internalFormat, (int)width, (int)height, (int)imageSize, (int)prevPBO );
+		}
+	}
+
+	if ( nDebug >= 2 )
+	{
+		Msg( "ASTC: upload target 0x%X level %d format 0x%X %dx%d (%d bytes)\n",
+			 (unsigned)target, (int)level, (unsigned)internalFormat, (int)width, (int)height, (int)imageSize );
+	}
+
+	if ( prevPBO != 0 )
+		gGL->glBindBuffer( GL_PIXEL_UNPACK_BUFFER, (GLuint)prevPBO );
+}
+
+// glCompressedTexSubImage2D may or may not be present in this build's GL entry point table, and the
+// header that lists it is not part of this source subset. These two overload pairs let the same code
+// compile either way: the (int) overloads exist only if the entry point can be called, otherwise the
+// (long) overloads are picked and the caller falls back to re-uploading the whole level.
+template< typename GL >
+static auto GLM_HasCSubImg2D( GL *gl, int )
+	-> decltype( gl->glCompressedTexSubImage2D( GLenum(0), GLint(0), GLint(0), GLint(0), GLsizei(0), GLsizei(0), GLenum(0), GLsizei(0), (const void *)0 ), bool() )
+{
+	return true;
+}
+
+template< typename GL >
+static bool GLM_HasCSubImg2D( GL *, long )
+{
+	return false;
+}
+
+template< typename GL >
+static auto GLM_CSubImg2D( GL *gl, GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
+						   GLenum fmt, GLsizei size, const void *data, int )
+	-> decltype( gl->glCompressedTexSubImage2D( target, level, x, y, w, h, fmt, size, data ), bool() )
+{
+	gl->glCompressedTexSubImage2D( target, level, x, y, w, h, fmt, size, data );
+	return true;
+}
+
+template< typename GL >
+static bool GLM_CSubImg2D( GL *, GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLsizei, const void *, long )
+{
+	return false;
+}
+
+// Partial update of an ASTC level that already exists on the GPU: re-encode only the ASTC blocks that cover
+// the dirty box (taken from the CPU shadow copy, which holds the whole slice) and replace just those blocks.
+// An ASTC sub-image upload must start on a block boundary and either be a whole number of blocks or run to the
+// edge of the level, which is exactly what the expanded box guarantees.
+// Returns false if it could not be done (the caller then re-encodes and uploads the whole level).
+static bool GLM_AstcPartialUpdate2D( GLenum target, int mip, int sliceW, int sliceH, const GLMRegion &box,
+									 const void *sliceSrc, int bytesPerTexel,
+									 bool isHDR, bool isSRGB, bool forceOpaque,
+									 GLenum srcFormat, GLenum srcType, bool allowDiskCache )
+{
+	if ( !sliceSrc || bytesPerTexel <= 0 )
+		return false;
+
+	if ( !GLM_HasCSubImg2D( gGL, 0 ) )
+	{
+		static bool s_bWarnedNoSubImage = false;
+		if ( !s_bWarnedNoSubImage )
+		{
+			s_bWarnedNoSubImage = true;
+			Msg( "ASTC: glCompressedTexSubImage2D is not in this build's GL function table; partial texture updates re-encode the whole level (correct, just slower).\n" );
+		}
+		return false;
+	}
+
+	int bw = 0, bh = 0;
+	ASTC_GetConfiguredBlockSize( isHDR, &bw, &bh );
+	if ( bw <= 0 || bh <= 0 )
+		return false;
+
+	// An empty box must stay empty: rounding it out to whole blocks below would turn it into a block-sized upload.
+	if ( box.xmax <= box.xmin || box.ymax <= box.ymin )
+		return true;
+
+	int x0 = ( box.xmin / bw ) * bw;
+	int y0 = ( box.ymin / bh ) * bh;
+	int x1 = ( ( box.xmax + bw - 1 ) / bw ) * bw;
+	int y1 = ( ( box.ymax + bh - 1 ) / bh ) * bh;
+	if ( x0 < 0 ) x0 = 0;
+	if ( y0 < 0 ) y0 = 0;
+	if ( x1 > sliceW ) x1 = sliceW;
+	if ( y1 > sliceH ) y1 = sliceH;
+
+	const int w = x1 - x0;
+	const int h = y1 - y0;
+	if ( w <= 0 || h <= 0 )
+		return true;            // empty box: nothing to upload
+	if ( w >= sliceW && h >= sliceH )
+		return false;           // it is the whole level anyway
+
+	// tightly packed copy of the region, in the source's own pixel layout
+	const size_t rowBytes = (size_t)w * (size_t)bytesPerTexel;
+	uint8_t *tmp = (uint8_t *)malloc( rowBytes * (size_t)h );
+	if ( !tmp )
+		return false;
+
+	const uint8_t *src = (const uint8_t *)sliceSrc;
+	for ( int y = 0; y < h; ++y )
+		memcpy( tmp + (size_t)y * rowBytes, src + ( (size_t)( y0 + y ) * (size_t)sliceW + (size_t)x0 ) * (size_t)bytesPerTexel, rowBytes );
+
+	ASTCEncodeResult r = {};
+	ASTC_CompressTextureRequired( isHDR, isSRGB, forceOpaque, tmp, w, h, srcFormat, srcType, &r, allowDiskCache );
+	free( tmp );
+
+	GLint prevPBO = 0;
+	gGL->glGetIntegerv( GL_PIXEL_UNPACK_BUFFER_BINDING, &prevPBO );
+	if ( prevPBO != 0 )
+		gGL->glBindBuffer( GL_PIXEL_UNPACK_BUFFER, 0 );
+
+	const bool bCheck = ( gl_astc_debug.GetInt() != 0 ) && ( s_nAstcGLErrorsLogged < 64 );
+	if ( bCheck )
+		GLM_DrainGLErrors();
+
+	const bool ok = GLM_CSubImg2D( gGL, target, (GLint)mip, (GLint)x0, (GLint)y0, (GLsizei)w, (GLsizei)h,
+								   (GLenum)r.m_glInternalFormat, (GLsizei)r.m_nDataSize, r.m_pData, 0 );
+
+	if ( bCheck )
+	{
+		const GLenum err = (GLenum)gGL->glGetError();
+		if ( err != GL_NO_ERROR )
+		{
+			++s_nAstcGLErrorsLogged;
+			Warning( "ASTC: glCompressedTexSubImage2D failed, GL error 0x%X (target 0x%X level %d, %d,%d %dx%d of %dx%d)\n",
+					 (unsigned)err, (unsigned)target, mip, x0, y0, w, h, sliceW, sliceH );
+		}
+	}
+
+	if ( prevPBO != 0 )
+		gGL->glBindBuffer( GL_PIXEL_UNPACK_BUFFER, (GLuint)prevPBO );
+
+	ASTC_FreeResult( &r );
+	return ok;
+}
+
 
 // encoding layout to an index where the bits read
 //	4	:	1 if compressed
@@ -776,7 +991,8 @@ CGLMTex::CGLMTex( GLMContext *ctx, GLMTexLayout *layout, uint levels, const char
 	m_mapped = NULL;
 	m_pbo = 0;
 
-	if( m_layout->m_key.m_texFlags & kGLMTexDynamic )
+	// ASTC-managed textures lock through CPU memory (see CGLMTex::Lock), so they never need a PBO.
+	if( ( m_layout->m_key.m_texFlags & kGLMTexDynamic ) && !GLMTexIsAstcManaged( m_layout ) )
 	{
 		gGL->glGenBuffers(1, &m_pbo);
 		gGL->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
@@ -846,7 +1062,8 @@ CGLMTex::CGLMTex( GLMContext *ctx, GLMTexLayout *layout, uint levels, const char
 	// Create backing storage and fill it
 	if ( !(layout->m_key.m_texFlags & kGLMTexRenderable) && m_texClientStorage )
 	{
-		m_backing = (char *)malloc( m_layout->m_storageTotalSize );
+		// ASTC-managed textures get a zero-filled shadow copy (their later partial updates merge into it)
+		m_backing = (char *)( GLMTexIsAstcManaged( m_layout ) ? calloc( 1, m_layout->m_storageTotalSize ) : malloc( m_layout->m_storageTotalSize ) );
 
 		// track bytes allocated for non-RT's
 		int formindex = sEncodeLayoutAsIndex( &layout->m_key );
@@ -3464,10 +3681,13 @@ GLvoid *uncompressDXTc(GLsizei width, GLsizei height, GLenum format, GLsizei ima
     return pixels;
 }
 
+
 void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
-                            GLsizei width, GLsizei height, GLint border,
-                            GLsizei imageSize, const GLvoid *data) 
+							GLsizei width, GLsizei height, GLint border,
+							GLsizei imageSize, const GLvoid *data) 
 {
+	(void)border;
+
 	if (internalformat==GL_RGBA8)
 		internalformat = GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
 
@@ -3475,13 +3695,11 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 		return;
 	}
 
-	bool hasAlpha = (internalformat != GL_COMPRESSED_RGB_S3TC_DXT1_EXT) && (internalformat != GL_COMPRESSED_SRGB_S3TC_DXT1_EXT);
-
-	GLenum format = hasAlpha ? GL_RGBA : GL_RGB;
-	GLenum intformat = hasAlpha ? GL_RGBA8 : GL_RGB8;
-	GLenum type = GL_UNSIGNED_BYTE;
-	GLvoid *pixels = NULL;
+	const bool hasAlpha = (internalformat != GL_COMPRESSED_RGB_S3TC_DXT1_EXT) && (internalformat != GL_COMPRESSED_SRGB_S3TC_DXT1_EXT);
+	const size_t srcBytesPerPixel = hasAlpha ? 4 : 3;
 	bool srgb = false;
+	GLvoid *pixels = NULL;
+	bool ownsPixels = false;
 
 	if (isDXTc(internalformat))
 	{
@@ -3491,42 +3709,31 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 		int transparent0 = (internalformat==GL_COMPRESSED_RGBA_S3TC_DXT1_EXT || internalformat==GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT)?1:0;
 		if (data) {
 			pixels = uncompressDXTc(width, height, internalformat, imageSize, transparent0, &simpleAlpha, &complexAlpha, data);
-		} else {
-			if(isDXTcAlpha(internalformat)) {
-				simpleAlpha = complexAlpha = 1;
-			}
+			// uncompressDXTc() hands back the caller's own pointer when the stream is already uncompressed,
+			// so only free what we allocated ourselves.
+			ownsPixels = ( pixels != NULL ) && ( pixels != data );
 		}
-
-		if( srgb )
-			intformat = hasAlpha ? GL_SRGB8_ALPHA8 : GL_SRGB8;
+	}
+	else if ( data && (size_t)imageSize >= (size_t)width * (size_t)height * srcBytesPerPixel )
+	{
+		// Not a DXT enum, but the caller handed us raw RGB(A) texels (and enough of them).
+		pixels = (GLvoid*)data;
 	}
 
-	// Mandatory: DXT bytes are never pushed to the GPU anymore, not even when
-	// the driver natively supports GL_EXT_texture_compression_dxt1 -- this
-	// function is called unconditionally for every DXT1/3/5 texture (see the
-	// WriteTexels call site), with no native-DXT-upload branch left.
-	// uncompressDXTc() above already decoded the source to RGB(A); re-encode
-	// those pixels as ASTC here instead of uploading them raw. DXT1/3/5 is
-	// always 8-bit normalized color, so this is always LDR, never HDR.
-	//
-	// uncompressDXTc() hands back the caller's own pointer when the stream is
-	// already uncompressed, so only free what we allocated ourselves.
-	bool ownsPixels = ( pixels != NULL ) && ( pixels != data );
-
+	// Mandatory: DXT bytes are never pushed to the GPU, not even when the driver natively supports
+	// GL_EXT_texture_compression_dxt1. uncompressDXTc() decoded the source to tightly packed RGB (DXT1 without
+	// alpha) or RGBA; re-encode those pixels as ASTC. DXT is always 8-bit normalized color, so always LDR.
 	if ( !pixels )
 	{
-		if ( data )
-		{
-			// Non-DXT internalformat with data: treat as raw RGB(A) texels.
-			pixels = (GLvoid*)data;
-		}
-		else
-		{
-			// No source data (storage-only definition): define the level as
-			// zero-filled ASTC so the texture still never exists uncompressed.
-			pixels = calloc( (size_t)width * height, hasAlpha ? 4 : 3 );
-			ownsPixels = true;
-		}
+		// Storage-only definition (no source data, or nothing decodable): define the level as blank ASTC blocks.
+		// No encoder run and no cache entry are needed for that.
+		ASTCEncodeResult blank = {};
+		if ( !ASTC_MakeBlankTexture( /*isHDR=*/false, srgb, /*opaqueAlpha=*/!hasAlpha, width, height, &blank ) )
+			Error( "CompressedTexImage2D: out of memory creating a blank %dx%d ASTC level\n", (int)width, (int)height );
+
+		GLM_UploadAstcLevel2D( target, level, (GLenum)blank.m_glInternalFormat, width, height, (GLsizei)blank.m_nDataSize, blank.m_pData );
+		ASTC_FreeResult( &blank );
+		return;
 	}
 
 	const void *rgbaSrc = pixels;
@@ -3534,12 +3741,19 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 
 	if ( !hasAlpha )
 	{
-		// DXT1-no-alpha decodes to tightly packed 3-byte RGB; ASTC
-		// encoding wants 4-byte RGBA, so pad in an opaque alpha channel.
-		int nPixels = width * height;
+		// DXT1-no-alpha decodes to tightly packed 3-byte RGB; ASTC encoding wants 4-byte RGBA,
+		// so pad in an opaque alpha channel.
+		const size_t nPixels = (size_t)width * (size_t)height;
 		const uint8_t *rgb = (const uint8_t*)pixels;
-		paddedRGBA = (uint8_t*)malloc( (size_t)nPixels * 4 );
-		for ( int i = 0; i < nPixels; ++i )
+		paddedRGBA = (uint8_t*)malloc( nPixels * 4 );
+		if ( !paddedRGBA )
+		{
+			if ( ownsPixels )
+				free( pixels );
+			Error( "CompressedTexImage2D: out of memory padding a %dx%d texture\n", (int)width, (int)height );
+			return;
+		}
+		for ( size_t i = 0; i < nPixels; ++i )
 		{
 			paddedRGBA[i*4+0] = rgb[i*3+0];
 			paddedRGBA[i*4+1] = rgb[i*3+1];
@@ -3551,11 +3765,10 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 
 	ASTCEncodeResult astcResult = {};
 	ASTC_CompressTextureRequired( /*isHDR=*/false, srgb, /*forceOpaque=*/!hasAlpha, rgbaSrc, width, height,
-								   GL_RGBA, GL_UNSIGNED_BYTE, &astcResult );
+								  GL_RGBA, GL_UNSIGNED_BYTE, &astcResult );
 
-	gGL->glCompressedTexImage2D( target, level, (GLenum)astcResult.m_glInternalFormat,
-								  width, height, border,
-								  astcResult.m_nDataSize, astcResult.m_pData );
+	GLM_UploadAstcLevel2D( target, level, (GLenum)astcResult.m_glInternalFormat, width, height,
+						   (GLsizei)astcResult.m_nDataSize, astcResult.m_pData );
 	ASTC_FreeResult( &astcResult );
 
 	if ( paddedRGBA )
@@ -3620,7 +3833,12 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 
 	void *sliceAddress = NULL;
 
-	if( m_mapped )
+	// ASTC-managed textures are never fed from a mapped PBO. By the time WriteTexels runs from Unlock() the PBO
+	// has already been unmapped (the old pointer is dangling), and a write-only mapping can't be read back anyway.
+	// They are encoded from the CPU shadow copy only.
+	const bool bAstcManaged = GLMTexIsAstcManaged( m_layout );
+
+	if( m_mapped && !bAstcManaged )
 		sliceAddress = m_mapped;
 	else if( m_backing )
 		sliceAddress = m_backing + slice->m_storageOffset;
@@ -3631,8 +3849,6 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 	// Every non-render-target color texture of an ASTC-eligible format lives on
 	// the GPU as ASTC. glTexSubImage2D with uncompressed data on a compressed
 	// level is GL_INVALID_OPERATION, so these always re-encode the whole slice.
-	const bool bAstcManaged = !( m_layout->m_key.m_texFlags & ( kGLMTexMultisampled | kGLMTexRenderable ) )
-		&& ASTC_IsEligibleFormat( (int)m_layout->m_key.m_texFormat );
 
 	if ( (target==GL_TEXTURE_2D) && !bAstcManaged && (m_sliceFlags[ desc->m_sliceIndex ] & kSliceValid) )
 		mayUseSubImage = true;
@@ -3800,40 +4016,49 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 
 					if ( bMustASTC )
 					{
-						bool isHDR = ASTC_IsHDRFormat( (int)m_layout->m_key.m_texFormat );
-						bool isSRGB = ( format->m_glIntFormatSRGB != format->m_glIntFormat ) && ( intformat == format->m_glIntFormatSRGB );
-						bool forceOpaque = !ASTC_FormatHasAlpha( (int)m_layout->m_key.m_texFormat );
+						const bool isHDR = ASTC_IsHDRFormat( (int)m_layout->m_key.m_texFormat );
+						const bool isSRGB = ( format->m_glIntFormatSRGB != format->m_glIntFormat ) && ( intformat == format->m_glIntFormatSRGB );
+						const bool forceOpaque = !ASTC_FormatHasAlpha( (int)m_layout->m_key.m_texFormat );
+						// dynamic textures change all the time; don't litter the on-disk cache with them
+						const bool allowDiskCache = !( m_layout->m_key.m_texFlags & kGLMTexDynamic );
+						const unsigned char curSliceFlags = m_sliceFlags[ desc->m_sliceIndex ];
 
-						// Source: the slice's backing store when we have one (this also
-						// covers partial writes -- the whole slice is re-encoded from the
-						// backing copy). With no data (storage-only definition) define the
-						// level as zero-filled ASTC instead of falling back to uncompressed.
-						const void *astcSrc = ( noDataWrite || !sliceAddress ) ? NULL : sliceAddress;
-						void *zeroSrc = NULL;
-						GLenum astcSrcFormat = glDataFormat;
-						GLenum astcSrcType = glDataType;
-						if ( !astcSrc )
+						// The CPU shadow copy is a trustworthy source only once Lock() has marked this slice's storage
+						// valid. Anything else (the constructor's placeholder push, no backing at all, RT-style
+						// storage-only writes) is a storage-only definition: blank ASTC blocks, no encoder run.
+						const bool bHaveSrc = !noDataWrite && sliceAddress && ( curSliceFlags & kSliceStorageValid );
+
+						bool bUploaded = false;
+
+						// Partial update of a level that already exists on the GPU: re-encode and replace only the
+						// ASTC blocks that cover the dirty box instead of re-encoding the entire texture.
+						if ( bHaveSrc && !writeWholeSlice && ( curSliceFlags & kSliceValid ) && format->m_chunkSize == 1 )
 						{
-							zeroSrc = calloc( (size_t)slice->m_xSize * slice->m_ySize, 4 );
-							astcSrc = zeroSrc;
-							astcSrcFormat = GL_RGBA;
-							astcSrcType = GL_UNSIGNED_BYTE;
-							isHDR = false;
-							forceOpaque = false;
+							bUploaded = GLM_AstcPartialUpdate2D( target, desc->m_req.m_mip, slice->m_xSize, slice->m_ySize, writeBox,
+																 sliceAddress, (int)format->m_bytesPerSquareChunk,
+																 isHDR, isSRGB, forceOpaque, glDataFormat, glDataType, allowDiskCache );
 						}
 
-						ASTCEncodeResult astcResult = {};
-						ASTC_CompressTextureRequired( isHDR, isSRGB, forceOpaque, astcSrc, slice->m_xSize, slice->m_ySize,
-													   astcSrcFormat, astcSrcType, &astcResult );
+						if ( !bUploaded )
+						{
+							ASTCEncodeResult astcResult = {};
 
-						// http://www.opengl.org/sdk/docs/man/xhtml/glCompressedTexImage2D.xml
-						gGL->glCompressedTexImage2D( target, desc->m_req.m_mip,
-													  (GLenum)astcResult.m_glInternalFormat,
-													  slice->m_xSize, slice->m_ySize, 0,
-													  astcResult.m_nDataSize, astcResult.m_pData );
-						ASTC_FreeResult( &astcResult );
-						if ( zeroSrc )
-							free( zeroSrc );
+							if ( bHaveSrc )
+							{
+								ASTC_CompressTextureRequired( isHDR, isSRGB, forceOpaque, sliceAddress, slice->m_xSize, slice->m_ySize,
+															  glDataFormat, glDataType, &astcResult, allowDiskCache );
+							}
+							else if ( !ASTC_MakeBlankTexture( isHDR, isSRGB, forceOpaque, slice->m_xSize, slice->m_ySize, &astcResult ) )
+							{
+								Error( "CGLMTex::WriteTexels: out of memory creating a blank %dx%d ASTC level\n", (int)slice->m_xSize, (int)slice->m_ySize );
+							}
+
+							// http://www.opengl.org/sdk/docs/man/xhtml/glCompressedTexImage2D.xml
+							GLM_UploadAstcLevel2D( target, desc->m_req.m_mip, (GLenum)astcResult.m_glInternalFormat,
+												   slice->m_xSize, slice->m_ySize,
+												   (GLsizei)astcResult.m_nDataSize, astcResult.m_pData );
+							ASTC_FreeResult( &astcResult );
+						}
 					}
 					else
 					{
@@ -3950,8 +4175,17 @@ void CGLMTex::Lock( GLMTexLockParams *params, char** addressOut, int* yStrideOut
 	// d - the params of the lock request have been saved in the lock table (in the context)
 	
 	// so step 1 is unambiguous.  If there's no backing storage, make some.
-	if (!m_backing && !(m_layout->m_key.m_texFlags & kGLMTexDynamic))
+	//
+	// ASTC-managed textures always lock through CPU memory, never a mapped PBO: they are re-encoded on the CPU
+	// at Unlock() time, and a write-only mapped PBO can neither be read back nor survive glUnmapBuffer().
+	// Their backing is zero-filled, so any region the caller doesn't write is defined (transparent black, which
+	// is what the blank placeholder level on the GPU holds) instead of leftover heap contents.
+	const bool bAstcManaged = GLMTexIsAstcManaged( m_layout );
+
+	if (!m_backing && ( bAstcManaged || !(m_layout->m_key.m_texFlags & kGLMTexDynamic) ))
 	{
+		size_t nBackingBytes = (size_t)m_layout->m_storageTotalSize;
+
 		if ( gl_pow2_tempmem.GetBool() )
 		{
 			uint32_t unStoragePow2 = m_layout->m_storageTotalSize;
@@ -3963,12 +4197,10 @@ void CGLMTex::Lock( GLMTexLockParams *params, char** addressOut, int* yStrideOut
 			unStoragePow2 |= unStoragePow2 >> 8;
 			unStoragePow2 |= unStoragePow2 >> 16;
 			unStoragePow2++;
-			m_backing = (char *)malloc( unStoragePow2 );
+			nBackingBytes = unStoragePow2;
 		}
-		else
-		{
-			m_backing = (char *)malloc( m_layout->m_storageTotalSize );
-		}
+
+		m_backing = (char *)( bAstcManaged ? calloc( 1, nBackingBytes ) : malloc( nBackingBytes ) );
 
 		// clear the kSliceStorageValid bit on all slices
 		for( int i=0; i<m_layout->m_sliceCount; i++)
@@ -4062,7 +4294,7 @@ void CGLMTex::Lock( GLMTexLockParams *params, char** addressOut, int* yStrideOut
 
 	desc->m_sliceRegionOffset = offsetInSlice + desc->m_sliceBaseOffset;
 
-	if ( (m_layout->m_key.m_texFlags & kGLMTexDynamic) || (params->m_readonly && copyout) )
+	if ( !bAstcManaged && ( (m_layout->m_key.m_texFlags & kGLMTexDynamic) || (params->m_readonly && copyout) ) )
 	{
 		// read the whole slice
 		// (odds are we'll never request anything but a whole slice to be read..)
@@ -4202,7 +4434,7 @@ void CGLMTex::Unlock( GLMTexLockParams *params )
 		// because it reuploads the whole thing each slice; we only use 3D textures
 		// for the 32x32x32 colorpsace conversion lookups and debugging the problem
 		// would not save any more memory.
-		if ( !m_texClientStorage && ( m_texGLTarget == GL_TEXTURE_2D ) && m_backing )
+		if ( !m_texClientStorage && ( m_texGLTarget == GL_TEXTURE_2D ) && m_backing && !GLMTexKeepsAstcShadow( m_layout ) )
 		{
 			free(m_backing);
 			m_backing = NULL;
