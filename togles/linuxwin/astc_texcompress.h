@@ -1,4 +1,4 @@
-//========= ASTC runtime recompression (added on top of Valve TOGL) - v2 =======//
+//========= ASTC runtime recompression (added on top of Valve TOGL) - v3 =======//
 //
 // astc_texcompress.h
 //
@@ -22,6 +22,16 @@
 //     storage without data (placeholder / ResetSRGB) instead of falling back
 //     to an uncompressed glTexImage2D, which would break later compressed
 //     writes to the same texture.
+//
+// v3 changes (black screen / crash fixes):
+//   * Dynamic (PBO-backed) textures are never encoded from an unmapped PBO pointer any more;
+//     the GL layer keeps a CPU shadow copy for ASTC-managed textures instead.
+//   * ASTC uploads always happen with GL_PIXEL_UNPACK_BUFFER unbound (with a PBO bound, the
+//     data pointer of glCompressedTexImage2D is a byte offset, not a CPU pointer).
+//   * Storage-only / placeholder levels use ASTC_MakeBlankTexture() (no encoder run, no cache file).
+//   * Partial updates re-encode only the ASTC blocks covering the dirty box.
+//   * An encode failure is no longer fatal: it warns and falls back to a blank ASTC level.
+//   * gl_astc_debug: checks glGetError after ASTC uploads and logs failures to the engine log.
 //
 // ASTC recompression is MANDATORY: ASTC_CompressTextureRequired() never lets an
 // eligible texture reach the GPU uncompressed. If astcenc isn't built in
@@ -97,7 +107,10 @@ bool ASTC_IsValidBlockSize( int w, int h );
 
 // Encodes an image. Returns false (outResult zeroed) if astcenc isn't built in,
 // the source layout is unknown, or encoding failed. Prefer
-// ASTC_CompressTextureRequired(), which treats those as fatal.
+// ASTC_CompressTextureRequired(), which falls back to a blank ASTC image instead of
+// ever handing back uncompressed data.
+// allowDiskCache = false skips the on-disk cache for this call (used for dynamic textures,
+// whose contents change constantly and would only litter the cache directory).
 bool ASTC_CompressTexture(
 	const void* srcData,
 	int width,
@@ -110,11 +123,13 @@ bool ASTC_CompressTexture(
 	int blockW,
 	int blockH,
 	int qualityPreset,
-	ASTCEncodeResult* outResult );
+	ASTCEncodeResult* outResult,
+	bool allowDiskCache = true );
 
 // Mandatory entry point used by every upload path. Uses the configured block
 // size (gl_astc_block_ldr / gl_astc_block_hdr). Never returns an uncompressed
-// result; failure is fatal.
+// result. If encoding fails it warns (engine log) and returns a blank ASTC image of
+// the right size and format, so the texture stays ASTC and the game keeps running.
 void ASTC_CompressTextureRequired(
 	bool isHDR,
 	bool isSRGB,
@@ -124,7 +139,8 @@ void ASTC_CompressTextureRequired(
 	int height,
 	unsigned int srcGLFormat,
 	unsigned int srcGLType,
-	ASTCEncodeResult* outResult );
+	ASTCEncodeResult* outResult,
+	bool allowDiskCache = true );
 
 // Valid ASTC blocks that encode a solid color (opaque black, or transparent
 // black if !opaqueAlpha). No encoder is needed. Use this for placeholder and
@@ -151,5 +167,6 @@ extern ConVar gl_astc_cache;		// 1 = use on-disk encode cache
 extern ConVar gl_astc_cache_dir;	// cache directory, relative to the game's working dir
 extern ConVar gl_astc_alpha_weight;	// 1 = alpha-weighted encoding when a texture has alpha
 extern ConVar gl_astc_perceptual;	// 1 = perceptual error metric for LDR profiles
+extern ConVar gl_astc_debug;		// 0 = off, 1 = glGetError after ASTC uploads (failures logged), 2 = log every upload
 
 #endif // ASTC_TEXCOMPRESS_H
