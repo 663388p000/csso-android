@@ -10,6 +10,11 @@
 //   4. reads and writes the single-file on-disk encode cache (astc_cache.bin)
 //   5. builds solid-color blank ASTC images without the encoder
 //
+// NOTE: std::unordered_map / std::unordered_set are deliberately NOT used. The libc++
+// headers of NDK r10e fail to compile under Clang 11 ("exception specification in
+// declaration does not match previous declaration" in __hash_table), so std::map /
+// std::set are used instead.
+//
 //===============================================================================
 
 #include "astc_texcompress.h"
@@ -28,8 +33,8 @@
 	#include <vector>
 	#include <atomic>
 	#include <chrono>
-	#include <unordered_set>
-	#include <unordered_map>
+	#include <set>
+	#include <map>
 	#include <string>
 	#include <cstdint>
 	#ifdef _WIN32
@@ -1167,7 +1172,7 @@ public:
 	bool Get( uint64_t key, uint8_t* dst, size_t size )
 	{
 		std::lock_guard<std::mutex> lk( m_mtx );
-		std::unordered_map<uint64_t, Node*>::iterator it = m_map.find( key );
+		std::map<uint64_t, Node*>::iterator it = m_map.find( key );
 		if ( it == m_map.end() )
 			return false;
 		Node* n = it->second;
@@ -1184,7 +1189,7 @@ public:
 			return;
 
 		std::lock_guard<std::mutex> lk( m_mtx );
-		std::unordered_map<uint64_t, Node*>::iterator it = m_map.find( key );
+		std::map<uint64_t, Node*>::iterator it = m_map.find( key );
 		if ( it != m_map.end() )
 		{
 			MoveToFront( it->second );
@@ -1282,7 +1287,7 @@ private:
 	}
 
 	std::mutex							m_mtx;
-	std::unordered_map<uint64_t, Node*>	m_map;
+	std::map<uint64_t, Node*>			m_map;
 	Node*								m_head;
 	Node*								m_tail;
 	size_t								m_bytes;
@@ -2272,7 +2277,7 @@ void ASTC_CacheStore( uint64_t key, const ASTCEncodeResult* result )
 
 // ---- textures whose CPU shadow copy must survive Unlock() ----
 static std::mutex s_shadowMutex;
-static std::unordered_set<const void*> s_shadowSet;
+static std::set<const void*> s_shadowSet;
 
 void ASTC_ShadowTexAdd( const void* tex )
 {
