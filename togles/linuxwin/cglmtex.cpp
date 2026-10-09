@@ -163,8 +163,8 @@ static void GLM_UploadAstcLevel2D( GLenum target, GLint level, GLenum internalFo
 }
 
 // glCompressedTexSubImage2D is core OpenGL ES 2.0/3.0, but it is not in this build's GL function table, so it is
-// fetched straight from the driver (through the same lookup callback the table uses) the first time it is needed.
-extern void *GLM_LookupGLProc( const char *fn );		// glentrypoints.cpp
+// fetched straight from the driver the first time it is needed (dlsym first, eglGetProcAddress as fallback).
+extern "C" void *dlsym( void *handle, const char *symbol );
 
 typedef void ( *GLM_PFN_CompressedTexSubImage2D )( GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLsizei, const void * );
 
@@ -175,7 +175,17 @@ static GLM_PFN_CompressedTexSubImage2D GLM_GetCompressedTexSubImage2D()
 	if ( !s_bTried )
 	{
 		s_bTried = true;
-		s_pfn = (GLM_PFN_CompressedTexSubImage2D)GLM_LookupGLProc( "glCompressedTexSubImage2D" );
+
+		void *p = dlsym( (void *)0, "glCompressedTexSubImage2D" );	// RTLD_DEFAULT
+		if ( !p )
+		{
+			typedef void *( *GLM_PFN_GetProcAddress )( const char * );
+			GLM_PFN_GetProcAddress pfnGetProc = (GLM_PFN_GetProcAddress)dlsym( (void *)0, "eglGetProcAddress" );
+			if ( pfnGetProc )
+				p = pfnGetProc( "glCompressedTexSubImage2D" );
+		}
+
+		s_pfn = (GLM_PFN_CompressedTexSubImage2D)p;
 		Msg( "ASTC: glCompressedTexSubImage2D %s\n",
 			 s_pfn ? "is available: partial texture updates only re-encode the blocks they touch"
 				   : "is NOT available: partial texture updates re-encode the whole level" );
