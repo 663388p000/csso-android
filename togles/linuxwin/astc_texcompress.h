@@ -1,4 +1,4 @@
-//========= ASTC runtime recompression (added on top of Valve TOGL) - v3 =======//
+//========= ASTC runtime recompression (added on top of Valve TOGL) - v4 =======//
 //
 // astc_texcompress.h
 //
@@ -22,6 +22,15 @@
 //     storage without data (placeholder / ResetSRGB) instead of falling back
 //     to an uncompressed glTexImage2D, which would break later compressed
 //     writes to the same texture.
+//
+// v4 changes (speed, cache, stability):
+//   * One cache file (astc_cache/astc_cache.bin) replaces thousands of small .astc files:
+//     an on-disk hash table plus an append-only data area, opened once, read with pread().
+//   * DXT sources are cached by their compressed bytes, so a cache hit skips the DXT decode.
+//   * The encoder pool uses every CPU core (gl_astc_threads 0 = all cores) and wakes only as
+//     many threads as an image has work for.
+//   * Textures that receive partial updates keep their CPU shadow copy (see ASTC_ShadowTex*).
+//   * Periodic throughput / cache statistics in the engine log (gl_astc_stats).
 //
 // v3 changes (black screen / crash fixes):
 //   * Dynamic (PBO-backed) textures are never encoded from an unmapped PBO pointer any more;
@@ -47,6 +56,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 #include "tier1/convar.h"
 
 // GL enums for ASTC (KHR_texture_compression_astc_ldr / _hdr). Guarded in case
@@ -140,7 +150,33 @@ void ASTC_CompressTextureRequired(
 	unsigned int srcGLFormat,
 	unsigned int srcGLType,
 	ASTCEncodeResult* outResult,
-	bool allowDiskCache = true );
+	bool allowDiskCache = true,
+	bool* outFallback = 0 );		// set to true if the encode failed and a blank image was returned
+
+// ---- Cache access for callers that can identify their source more cheaply than decoded pixels ----
+// (DXT: the compressed blocks are 4-8x smaller than the decoded RGBA, and a cache hit skips the decode.)
+// The key covers the source bytes, dimensions, the caller's format id and every encoder setting.
+uint64_t ASTC_ExternalCacheKey(
+	const void* srcBytes,
+	size_t srcLen,
+	unsigned int srcFormatId,
+	int width,
+	int height,
+	bool isHDR,
+	bool isSRGB,
+	bool forceOpaque );
+
+// On a hit fills outResult with a malloc'd ASTC image (free with ASTC_FreeResult) and returns true.
+bool ASTC_CacheLookup( uint64_t key, int width, int height, bool isHDR, bool isSRGB, ASTCEncodeResult* outResult );
+
+// Stores a successfully encoded image under 'key'.
+void ASTC_CacheStore( uint64_t key, const ASTCEncodeResult* result );
+
+// ---- Textures that need their CPU shadow copy kept after Unlock() ----
+// (partial updates are merged into the shadow copy and re-encoded; see CGLMTex::Unlock)
+void ASTC_ShadowTexAdd( const void* tex );
+bool ASTC_ShadowTexHas( const void* tex );
+void ASTC_ShadowTexRemove( const void* tex );
 
 // Valid ASTC blocks that encode a solid color (opaque black, or transparent
 // black if !opaqueAlpha). No encoder is needed. Use this for placeholder and
@@ -167,6 +203,8 @@ extern ConVar gl_astc_cache;		// 1 = use on-disk encode cache
 extern ConVar gl_astc_cache_dir;	// cache directory, relative to the game's working dir
 extern ConVar gl_astc_alpha_weight;	// 1 = alpha-weighted encoding when a texture has alpha
 extern ConVar gl_astc_perceptual;	// 1 = perceptual error metric for LDR profiles
+extern ConVar gl_astc_cache_max_mb;	// size limit of astc_cache/astc_cache.bin
+extern ConVar gl_astc_stats;		// 1 = periodic encode throughput + cache statistics in the engine log
 extern ConVar gl_astc_debug;		// 0 = off, 1 = glGetError after ASTC uploads (failures logged), 2 = log every upload
 
 #endif // ASTC_TEXCOMPRESS_H
