@@ -3994,6 +3994,10 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 				// and re-encode as ASTC unconditionally, even when the driver
 				// natively supports GL_EXT_texture_compression_dxt1 (see
 				// CompressedTexImage2D() below).
+				if ( gl_astc_debug.GetInt() >= 3 )
+					Msg( "ASTC: tex '%s' %s mip %d face %d: DXT, %s\n", m_debugLabel ? m_debugLabel : "-", m_layout->m_layoutSummary,
+						 (int)desc->m_req.m_mip, (int)desc->m_req.m_face, sliceAddress ? "encoded from data" : "blank (no data yet)" );
+
 				CompressedTexImage2D( target, desc->m_req.m_mip, intformat, slice->m_xSize, slice->m_ySize, 0, slice->m_storageSize, sliceAddress );
 			}
 			else
@@ -4069,6 +4073,10 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 						// valid. Anything else (the constructor's placeholder push, no backing at all, RT-style
 						// storage-only writes) is a storage-only definition: blank ASTC blocks, no encoder run.
 						const bool bHaveSrc = !noDataWrite && sliceAddress && ( curSliceFlags & kSliceStorageValid );
+
+						if ( gl_astc_debug.GetInt() >= 3 )
+							Msg( "ASTC: tex '%s' %s mip %d face %d: %s\n", m_debugLabel ? m_debugLabel : "-", m_layout->m_layoutSummary,
+								 (int)desc->m_req.m_mip, (int)desc->m_req.m_face, bHaveSrc ? "encoded from data" : "blank (no data yet)" );
 
 						bool bUploaded = false;
 
@@ -4335,6 +4343,19 @@ void CGLMTex::Lock( GLMTexLockParams *params, char** addressOut, int* yStrideOut
 	// pushed across at unlock time.
 
 	desc->m_sliceRegionOffset = offsetInSlice + desc->m_sliceBaseOffset;
+
+	if ( bAstcManaged && params->m_readonly )
+	{
+		// An ASTC level can't be read back from the GPU. The caller gets the CPU shadow copy, which is all zeros
+		// if the texture was never written through Lock(). Say so (a few times) so such a texture can be found.
+		static int s_nReadonlyAstcWarned = 0;
+		if ( s_nReadonlyAstcWarned < 16 )
+		{
+			++s_nReadonlyAstcWarned;
+			Warning( "ASTC: read-only lock of the ASTC texture '%s' %s returns its CPU shadow copy (zeros if it was never written through Lock)\n",
+					 m_debugLabel ? m_debugLabel : "-", m_layout->m_layoutSummary );
+		}
+	}
 
 	if ( !bAstcManaged && ( (m_layout->m_key.m_texFlags & kGLMTexDynamic) || (params->m_readonly && copyout) ) )
 	{
