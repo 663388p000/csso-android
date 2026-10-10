@@ -1,4 +1,4 @@
-//========= ASTC runtime recompression (added on top of Valve TOGL) - v4 =======//
+//========= ASTC runtime recompression (added on top of Valve TOGL) - v5 =======//
 //
 // astc_texcompress.cpp
 //
@@ -7,7 +7,8 @@
 //   2. normalizes the caller's (GL format, type) into what astcenc wants,
 //      with zero-copy handling for 8-bit BGRA/RGBA sources
 //   3. runs astcenc on a persistent thread pool (every CPU core) with shared contexts
-//   4. reads and writes the single-file on-disk encode cache (astc_cache.bin)
+//   4. keeps encoded blocks in a dynamic RAM cache; nothing is written to storage unless gl_astc_disk_cache is 1
+//      (then the single file astc_cache.bin is used as a second tier)
 //   5. builds solid-color blank ASTC images without the encoder
 //
 // NOTE: std::unordered_map / std::unordered_set are deliberately NOT used. The libc++
@@ -168,7 +169,12 @@ ConVar gl_astc_threads( "gl_astc_threads", "0", FCVAR_ARCHIVE,
 	"Encoder worker threads. 0 = auto = every CPU core of the device. 1 = single threaded. Applied at first use; restart to change." );
 
 ConVar gl_astc_cache( "gl_astc_cache", "1", FCVAR_ARCHIVE,
-	"1 = cache encoded ASTC blocks on disk, keyed by source pixels and encode parameters. Later loads of the same texture skip encoding." );
+	"1 = keep encoded ASTC blocks in a dynamic RAM cache, keyed by source pixels and encode parameters, so the same texture level is never encoded twice in one session. "
+	"Nothing is written to storage unless gl_astc_disk_cache is also 1." );
+
+ConVar gl_astc_disk_cache( "gl_astc_disk_cache", "0", FCVAR_ARCHIVE,
+	"0 (default) = ASTC textures live in RAM only, nothing is saved to storage; every launch encodes again. "
+	"1 = also keep a persistent second tier in the single file astc_cache/astc_cache.bin (much faster launches, uses storage). Applied at first use." );
 
 ConVar gl_astc_cache_dir( "gl_astc_cache_dir", "astc_cache", FCVAR_ARCHIVE,
 	"Directory for the ASTC encode cache file (astc_cache.bin), relative to the game's working directory. Safe to delete at any time." );
@@ -177,18 +183,19 @@ ConVar gl_astc_cache_max_mb( "gl_astc_cache_max_mb", "3584", FCVAR_ARCHIVE,
 	"Size limit of the single ASTC cache file in MB (kept under 4 GB so it also works on FAT32 cards). When it is full the file is wiped and the hot entries are written back. Delete astc_cache.bin to start over." );
 
 ConVar gl_astc_ram_cache_mb( "gl_astc_ram_cache_mb", "0", FCVAR_ARCHIVE,
-	"RAM tier of the ASTC cache: hot (recently reused) encodes are kept in memory so they never touch the disk file again. "
-	"0 = dynamic (up to 192 MB, shrinks to nothing when the device runs low on memory). -1 = off. >0 = fixed limit in MB." );
+	"RAM cache of encoded ASTC blocks (the only cache unless gl_astc_disk_cache is 1). "
+	"0 = dynamic (up to 256 MB, an eighth of the free memory at most, shrinks to nothing when the device runs low on memory). -1 = off. >0 = fixed limit in MB." );
 
 ConVar gl_astc_cache_cleanup_old( "gl_astc_cache_cleanup_old", "1", FCVAR_ARCHIVE,
-	"1 = at startup, delete the thousands of old per-texture <16 hex digits>.astc files that earlier versions wrote into the cache directory. "
-	"Only files with exactly that name pattern are touched." );
+	"1 = at startup, delete what earlier versions left in the cache directory: the old per-texture <16 hex digits>.astc files and, while "
+	"gl_astc_disk_cache is 0, astc_cache.bin. Only files with exactly those names are touched." );
 
 ConVar gl_astc_stats( "gl_astc_stats", "1", FCVAR_ARCHIVE,
 	"1 = write encode throughput and cache hit statistics to the engine log every ~20 seconds while textures are being processed." );
 
-ConVar gl_astc_alpha_weight( "gl_astc_alpha_weight", "1", FCVAR_ARCHIVE,
-	"1 = alpha-weighted encoding for textures that have an alpha channel. Improves color accuracy in translucent areas." );
+ConVar gl_astc_alpha_weight( "gl_astc_alpha_weight", "0", FCVAR_ARCHIVE,
+	"Legacy, ignored. Alpha-weighted encoding is never used any more: Source stores masks (phong, envmap, tint, selfillum) in alpha, "
+	"and weighting the color error by alpha wipes the color out wherever such a mask is dark (black gloves and weapon skins)." );
 
 ConVar gl_astc_perceptual( "gl_astc_perceptual", "1", FCVAR_ARCHIVE,
 	"1 = use the perceptual error metric for LDR (8/16-bit) encodes. Matches how the eye judges color error." );
@@ -1014,11 +1021,16 @@ static astcenc_error EncodeImage( astcenc_profile profile, int bw, int bh, float
 }
 
 // Encoder flags derived from the settings. Shared by the encoder and the cache keys.
+//
+// ASTCENC_FLG_USE_ALPHA_WEIGHT is deliberately never set. It scales the color error of every texel by that
+// texel's alpha, which is right for real transparency but wrong for Source: many materials keep a mask in
+// alpha (phong, envmap, tint, selfillum) and the color under a dark mask value is still shown. With alpha
+// weighting that color is treated as unimportant and is encoded badly or lost, which is what turns glove
+// and weapon-skin textures black. Every channel is weighted equally instead.
 static uint32_t ComputeEncodeFlags( bool isHDR, bool forceOpaque )
 {
+	(void)forceOpaque;
 	uint32_t flags = 0;
-	if ( !forceOpaque && gl_astc_alpha_weight.GetBool() )
-		flags |= ASTCENC_FLG_USE_ALPHA_WEIGHT;
 	if ( !isHDR && gl_astc_perceptual.GetBool() )
 		flags |= ASTCENC_FLG_USE_PERCEPTUAL;
 	return flags;
@@ -1140,7 +1152,7 @@ static size_t RamBudgetBytes()
 		uint64_t budget = 0;
 		if ( mb >= 0 )
 		{
-			budget = mb > 0 ? (uint64_t)mb * 1024ull * 1024ull : 192ull * 1024ull * 1024ull;
+			budget = mb > 0 ? (uint64_t)mb * 1024ull * 1024ull : 256ull * 1024ull * 1024ull;
 
 			const uint64_t availKB = ReadMemAvailableKB();
 			if ( availKB > 0 )
@@ -1287,7 +1299,7 @@ private:
 	}
 
 	std::mutex							m_mtx;
-	std::map<uint64_t, Node*>			m_map;
+	std::map<uint64_t, Node*>	m_map;
 	Node*								m_head;
 	Node*								m_tail;
 	size_t								m_bytes;
@@ -1399,9 +1411,16 @@ static bool IsOldCacheFileName( const char* name )
 	return false;
 }
 
+struct CleanupArgs
+{
+	char*	dir;
+	bool	alsoPack;		// also remove astc_cache.bin (the disk tier is off)
+};
+
 static void* OldCacheCleanupMain( void* arg )
 {
-	char* dir = (char*)arg;
+	CleanupArgs* args = (CleanupArgs*)arg;
+	const char* dir = args->dir;
 	std::vector<std::string> names;
 
 	DIR* d = opendir( dir );
@@ -1427,28 +1446,49 @@ static void* OldCacheCleanupMain( void* arg )
 			usleep( 2000 );		// be gentle with the storage while the game is loading
 	}
 	if ( !names.empty() )
-		Msg( "ASTC: removed %u old per-texture cache file(s); the cache is now the single file astc_cache.bin\n", (unsigned)removed );
+		Msg( "ASTC: removed %u old per-texture cache file(s)\n", (unsigned)removed );
 
-	free( dir );
+	if ( args->alsoPack )
+	{
+		char path[1200];
+		snprintf( path, sizeof( path ), "%s/astc_cache.bin", dir );
+		struct stat st;
+		if ( stat( path, &st ) == 0 && unlink( path ) == 0 )
+			Msg( "ASTC: removed the old cache file astc_cache.bin (%.1f MB); the disk tier is off, textures are kept in RAM only\n",
+				 (double)st.st_size / ( 1024.0 * 1024.0 ) );
+	}
+
+	free( args->dir );
+	free( args );
 	return NULL;
 }
 
-static void StartOldCacheCleanup( const char* dirName )
+static void StartOldCacheCleanup( const char* dirName, bool alsoPack )
 {
 	static std::atomic<bool> s_started( false );
 	if ( !gl_astc_cache_cleanup_old.GetBool() || s_started.exchange( true ) )
 		return;
 
-	char* dir = strdup( dirName );
-	if ( !dir )
+	CleanupArgs* args = (CleanupArgs*)malloc( sizeof( CleanupArgs ) );
+	if ( !args )
 		return;
+	args->dir = strdup( dirName );
+	args->alsoPack = alsoPack;
+	if ( !args->dir )
+	{
+		free( args );
+		return;
+	}
 
 	pthread_t th;
 	pthread_attr_t attr;
 	pthread_attr_init( &attr );
 	pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
-	if ( pthread_create( &th, &attr, &OldCacheCleanupMain, dir ) != 0 )
-		free( dir );
+	if ( pthread_create( &th, &attr, &OldCacheCleanupMain, args ) != 0 )
+	{
+		free( args->dir );
+		free( args );
+	}
 	pthread_attr_destroy( &attr );
 }
 
@@ -1499,8 +1539,13 @@ bool AstcPack::Open()
 		return m_state.load() > 0;
 	m_state.store( -1 );
 
-	if ( !gl_astc_cache.GetBool() || gl_astc_cache_dir.GetString()[0] == '\0' )
+	if ( !gl_astc_cache.GetBool() || !gl_astc_disk_cache.GetBool() || gl_astc_cache_dir.GetString()[0] == '\0' )
+	{
+		// RAM-only mode: nothing is read from or written to storage. Remove what earlier versions left behind.
+		if ( gl_astc_cache_dir.GetString()[0] != '\0' )
+			StartOldCacheCleanup( gl_astc_cache_dir.GetString(), /*alsoPack=*/!gl_astc_disk_cache.GetBool() );
 		return false;
+	}
 
 	const char* dir = gl_astc_cache_dir.GetString();
 	ASTC_MKDIR( dir );		// EEXIST is fine
@@ -1590,7 +1635,7 @@ bool AstcPack::Open()
 	Msg( "ASTC: cache file %s ready: %u entries, %.1f MB (limit %ld MB)\n",
 		 path, count, (double)m_syncedSize / ( 1024.0 * 1024.0 ), mb );
 
-	StartOldCacheCleanup( dir );
+	StartOldCacheCleanup( dir, /*alsoPack=*/false );
 	return true;
 }
 
@@ -1818,11 +1863,14 @@ void AstcPack::Store( uint64_t key, const uint8_t* data, size_t size )
 	if ( !data || size == 0 || size > 0x7FFFFFF0u )
 		return;
 
-	// A freshly encoded level that is tiny is cheap to keep hot; bigger ones earn RAM when they get reused.
-	if ( size <= kRamTinyBytes )
+	// RAM tier. With no disk file it is the only cache, so everything that fits is kept (least recently used goes
+	// first when the budget is full). With the disk tier on, only tiny levels are admitted up front and bigger ones
+	// earn their place when they are reused.
+	const bool diskOn = Ready();
+	if ( !diskOn || size <= kRamTinyBytes )
 		s_ram.Put( key, data, size, RamBudgetBytes() );
 
-	if ( !Ready() )
+	if ( !diskOn )
 		return;
 
 	std::lock_guard<std::mutex> io( m_ioMtx );
@@ -1925,8 +1973,7 @@ public:
 	}
 	void Store( uint64_t key, const uint8_t* data, size_t size )
 	{
-		if ( size <= kRamTinyBytes )
-			s_ram.Put( key ? key : 1, data, size, RamBudgetBytes() );
+		s_ram.Put( key ? key : 1, data, size, RamBudgetBytes() );
 	}
 	uint64_t SizeBytes() { return 0; }
 };
@@ -2031,7 +2078,8 @@ bool ASTC_CompressTexture(
 
 	// Cache lookup (RAM tier, then the single cache file). Keyed on the exact source bytes plus every
 	// parameter that changes the output. Dynamic textures (allowDiskCache == false) skip the cache entirely.
-	const bool useCache = allowDiskCache && gl_astc_cache.GetBool();
+	// (A level too big for the RAM tier is only worth hashing if the disk tier is on.)
+	const bool useCache = allowDiskCache && gl_astc_cache.GetBool() && ( compSize <= kRamEntryMax || GetPack()->Ready() );
 	uint64_t key = 0;
 	if ( useCache )
 	{
