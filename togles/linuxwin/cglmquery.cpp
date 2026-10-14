@@ -28,6 +28,8 @@
 
 #include "togles/rendermechanism.h"
 
+#include "mali_opt.h"
+
 #ifndef _WIN32
 	#include <unistd.h>
 #endif
@@ -163,7 +165,7 @@ void	CGLMQuery::Start( void )		// "start counting"
 			}
 			else
 			{
-				gGL->glBeginQuery( GL_ANY_SAMPLES_PASSED, m_name );
+				gGL->glBeginQuery( MaliOpt_OcclusionQueryTarget(), m_name );	// GL_ANY_SAMPLES_PASSED, or the cheaper _CONSERVATIVE variant on Mali
 			}
 		}
 		break;
@@ -204,7 +206,7 @@ void	CGLMQuery::Stop( void )			// "stop counting"
 			}
 			else
 			{
-				gGL->glEndQuery( GL_ANY_SAMPLES_PASSED );	// we are only putting the request-to-stop-counting into the cmd stream.
+				gGL->glEndQuery( MaliOpt_OcclusionQueryTarget() );	// we are only putting the request-to-stop-counting into the cmd stream.
 			}
 		}
 		break;
