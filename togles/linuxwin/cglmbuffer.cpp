@@ -514,9 +514,11 @@ CGLMBuffer::CGLMBuffer( GLMContext *pCtx, EGLMBufferType type, uint size, uint o
 			Error( "VirtualProtect() failed!\n" );
 		}
 #else
-		m_nActualSize = size + 15;
+		// 64-byte (cache line) alignment instead of 16: on Mali the driver copies client-side vertex/index data with
+		// vector loads at draw time, and cache-line aligned sources copy measurably faster.
+		m_nActualSize = size + 63;
 		m_pActualPseudoBuf = (char*)malloc( m_nActualSize );
-		m_pPseudoBuf = (char*)(((intp)m_pActualPseudoBuf + 15) & ~15);
+		m_pPseudoBuf = (char*)(((intp)m_pActualPseudoBuf + 63) & ~(intp)63);
 #endif
 		
 		m_pCtx->BindBufferToCtx( m_type, NULL );		// exit with no buffer bound
