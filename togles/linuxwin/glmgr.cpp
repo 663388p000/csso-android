@@ -37,6 +37,8 @@
 
 #include "convar.h"
 
+#include "mali_opt.h"
+
 #include "glmgr_flush.inl"
 
 #ifdef OSX
@@ -2211,6 +2213,32 @@ void GLMContext::Present( CGLMTex *tex )
 #endif
 
 		ProcessTextureDeletes();
+
+		// Mali / tile based GPUs: the depth and stencil of the frame that is being presented are dead from here on (the engine
+		// clears them again at the start of the next frame). Telling the driver, while the back buffer FBO is still the draw FBO
+		// and before its tiles are flushed, lets it skip writing depth/stencil back to memory - a big part of the memory
+		// traffic of a full screen pass. Only the back buffer FBO is touched, and only at Present. See mali_opt.h.
+		if ( m_boundDrawFBO && m_boundDrawFBO->m_attach[kAttColor0].m_tex == tex && MaliOpt_DiscardDepthAtPresent() )
+		{
+			unsigned int nDiscard[2];
+			int nNumDiscard = 0;
+
+			if ( m_boundDrawFBO->m_attach[kAttDepthStencil].m_tex )
+			{
+				nDiscard[nNumDiscard++] = GL_DEPTH_ATTACHMENT;
+				nDiscard[nNumDiscard++] = GL_STENCIL_ATTACHMENT;
+			}
+			else
+			{
+				if ( m_boundDrawFBO->m_attach[kAttDepth].m_tex )
+					nDiscard[nNumDiscard++] = GL_DEPTH_ATTACHMENT;
+				if ( m_boundDrawFBO->m_attach[kAttStencil].m_tex )
+					nDiscard[nNumDiscard++] = GL_STENCIL_ATTACHMENT;
+			}
+
+			if ( nNumDiscard )
+				MaliOpt_InvalidateFramebuffer( GL_DRAW_FRAMEBUFFER, nNumDiscard, nDiscard );
+		}
 
 		bool newRefreshMode = false;
 		// two ways to go:
