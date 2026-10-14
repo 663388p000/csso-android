@@ -227,6 +227,12 @@ def build(bld):
 		'linuxwin/asanstubs.cpp',
 		'linuxwin/decompress.c',
 		'linuxwin/astc_texcompress.cpp',
+
+		# Mali (ARM GPU) optimizations: program binary cache, glInvalidateFramebuffer, occlusion query target.
+		# The AArch64 NEON kernels live in the header linuxwin/arm_neon_opt.h (used by decompress.c,
+		# astc_texcompress.cpp and cglmtex.cpp). Add 'TOGL_DISABLE_ARM_NEON=1' to the defines to build the
+		# scalar code paths only.
+		'linuxwin/mali_opt.cpp',
 	]
 
 	if bld.env.DEST_OS == "darwin":
