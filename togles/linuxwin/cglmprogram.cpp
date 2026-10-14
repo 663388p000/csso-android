@@ -33,6 +33,9 @@
 #include "tier1/KeyValues.h"
 #include "tier0/fasttimer.h"
 
+// Mali optimizations: program binary cache (see mali_opt.h)
+#include "mali_opt.h"
+
 #if GLMDEBUG && defined( _MSC_VER )
 #include <direct.h>
 #endif
@@ -65,6 +68,13 @@ CON_COMMAND( gl_shader_compile_time_dump, "Dump  stats shader compile time." )
 }
 
 //===============================================================================
+
+// Program binary cache (mali_opt.cpp): while it is active CGLMProgram::Compile() only records the shader and postpones
+// glCompileShader(). Shader pairs that are found in the cache are restored with glProgramBinary() and never compile at all;
+// for the others CGLMShaderPair::SetProgramPair() calls CGLMProgram::CheckValidity(), which compiles the shader at that point.
+// This flag tells Compile() that it is being called for that purpose and has to do the real work.
+// All GL calls come from the thread that owns the context, so a plain static is enough.
+static bool s_bCompileShaderNow = false;
 
 
 GLenum	GLMProgTypeToARBEnum( EGLMProgramType type )
@@ -317,8 +327,19 @@ void	CGLMProgram::Compile( EGLMProgramLang lang )
 			GLenum glslStage = GLMProgTypeToGLSLEnum( m_type );
 			glslStage;
 			
+			// Program binary cache: do not compile yet. Most shader pairs of a later launch are restored from the cache
+			// without any of their shaders ever being compiled; CheckValidity() compiles the ones that are not.
+			if ( !s_bCompileShaderNow && MaliOpt_ProgramCacheActive() )
+			{
+				glslDesc->m_compiled = false;
+				glslDesc->m_valid = true;	// nothing is wrong so far; keeps ValidateProgramPair() from asking for the status of a shader that was never compiled
+				return;						// (the compile statistics below only count real compiles)
+			}
+
 			// no GLSL program either
-			gGL->glUseProgram(0);
+			// (a postponed compile runs while a pair is being linked and must not change which program is bound)
+			if ( !s_bCompileShaderNow )
+				gGL->glUseProgram(0);
 			
 			// pump text into GLSL shader object
 
@@ -578,6 +599,16 @@ bool CGLMProgram::CheckValidity( EGLMProgramLang lang )
 			glslDesc = &m_descs[ kGLMGLSL ];
 			
 			GLenum glslStage = GLMProgTypeToGLSLEnum( m_type ); glslStage;
+
+			// A shader whose compile was postponed (program binary cache, see Compile()) has no compile status yet.
+			// Somebody wants to know it, so compile it now.
+			if ( !glslDesc->m_compiled && glslDesc->m_textPresent )
+			{
+				const bool bSavedCompileNow = s_bCompileShaderNow;
+				s_bCompileShaderNow = true;
+				Compile( lang );
+				s_bCompileShaderNow = bSavedCompileNow;
+			}
 
 			Assert( glslDesc->m_compiled );
 	
@@ -979,7 +1010,33 @@ bool CGLMShaderPair::SetProgramPair( CGLMProgram *vp, CGLMProgram *fp )
 #endif
 
 		// now link
-		gGL->glLinkProgram( m_program );
+		// A pair that was linked before (by an earlier run) is restored from the program binary cache instead of being linked.
+		// The key covers both GLSL texts and the attribute binding done above; mali_opt.cpp verifies the file against the driver.
+		const bool bProgCache = vp->m_text && fp->m_text && MaliOpt_ProgramCacheActive();
+		uint64_t progCacheKey = 0;
+		bool bRestored = false;
+		if ( bProgCache )
+		{
+			const GLMShaderDesc &vpDesc = vp->m_descs[kGLMGLSL];
+			const GLMShaderDesc &fpDesc = fp->m_descs[kGLMGLSL];
+			progCacheKey = MaliOpt_ProgramKey( vp->m_text + vpDesc.m_textOffset, (size_t)vpDesc.m_textLength,
+				fp->m_text + fpDesc.m_textOffset, (size_t)fpDesc.m_textLength );
+			bRestored = MaliOpt_ProgramLoad( m_program, progCacheKey );
+		}
+
+		if ( !bRestored )
+		{
+			// shaders whose compile was postponed (see CGLMProgram::Compile) have to be compiled now
+			if ( !vp->m_descs[kGLMGLSL].m_compiled )
+				vp->CheckValidity( kGLMGLSL );
+			if ( !fp->m_descs[kGLMGLSL].m_compiled )
+				fp->CheckValidity( kGLMGLSL );
+
+			if ( bProgCache )
+				MaliOpt_ProgramPrepareLink( m_program );
+
+			gGL->glLinkProgram( m_program );
+		}
 
 		GLint isLinked = 0;
 		gGL->glGetProgramiv(m_program, GL_LINK_STATUS, &isLinked);
@@ -997,6 +1054,10 @@ bool CGLMShaderPair::SetProgramPair( CGLMProgram *vp, CGLMProgram *fp )
 			}
 		}
 		
+		// Keep the freshly linked program for the next run.
+		if ( bProgCache && !bRestored && isLinked != GL_FALSE )
+			MaliOpt_ProgramStore( m_program, progCacheKey );
+
 		m_bCheckLinkStatus = true;
 	}
 	else
