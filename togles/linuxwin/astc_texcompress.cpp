@@ -19,6 +19,7 @@
 //===============================================================================
 
 #include "astc_texcompress.h"
+#include "arm_neon_opt.h"	// AArch64 NEON texel conversion kernels (scalar fallback below)
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -394,10 +395,33 @@ static inline void MapChannels( ChanLayout lay, const V* c, V one, V* r, V* g, V
 	}
 }
 
+// AArch64: widens 8-bit sources to RGBA8 16 pixels at a time (ld2/ld3/ld4 + st4). Returns how many pixels were
+// converted (a multiple of 16, 0 when the NEON path is not compiled in); the scalar loop does the rest.
+static size_t ConvertPlanarU8Neon( const uint8_t* src, size_t n, ChanLayout lay, bool forceOpaque, uint8_t* dst )
+{
+	int l;
+	switch ( lay )
+	{
+		case kLay_RGBA: l = ARMOPT_LAY_RGBA; break;
+		case kLay_BGRA: l = ARMOPT_LAY_BGRA; break;
+		case kLay_RGB:  l = ARMOPT_LAY_RGB;  break;
+		case kLay_BGR:  l = ARMOPT_LAY_BGR;  break;
+		case kLay_RG:   l = ARMOPT_LAY_RG;   break;
+		case kLay_R:    l = ARMOPT_LAY_R;    break;
+		case kLay_L:    l = ARMOPT_LAY_L;    break;
+		case kLay_LA:   l = ARMOPT_LAY_LA;   break;
+		case kLay_A:    l = ARMOPT_LAY_A;    break;
+		default:        return 0;
+	}
+	return ArmOpt_U8ToRGBA( src, n, l, forceOpaque ? 1 : 0, dst );
+}
+
 template< typename T >
 static void ConvertPlanarUNorm( const uint8_t* src, size_t n, ChanLayout lay, int comps, bool forceOpaque, uint8_t* dst )
 {
-	for ( size_t i = 0; i < n; ++i )
+	const size_t first = ( sizeof( T ) == 1 ) ? ConvertPlanarU8Neon( src, n, lay, forceOpaque, dst ) : 0;
+
+	for ( size_t i = first; i < n; ++i )
 	{
 		uint8_t c[4] = { 0, 0, 0, 0 };
 		for ( int k = 0; k < comps; ++k )
@@ -566,7 +590,17 @@ static float* ConvertToRGBAF32( const void* srcData, size_t n, unsigned int glFo
 
 	if ( lay != kLay_Invalid && ( isHalf || isFloat ) )
 	{
-		for ( size_t i = 0; i < n; ++i )
+		// AArch64: RGBA / BGRA half and float sources are widened and sanitised with NEON (vcvt + clamp);
+		// the scalar loop below finishes the remainder (and does everything on other CPUs).
+		size_t first = 0;
+		if ( comps == 4 )
+		{
+			const int bgra = ( lay == kLay_BGRA ) ? 1 : 0;
+			first = isHalf ? ArmOpt_HalfRGBAToF32( src, n, bgra, forceOpaque ? 1 : 0, dst )
+						   : ArmOpt_F32RGBAToF32( src, n, bgra, forceOpaque ? 1 : 0, dst );
+		}
+
+		for ( size_t i = first; i < n; ++i )
 		{
 			float c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 			for ( int k = 0; k < comps; ++k )
@@ -930,6 +964,17 @@ struct SharedCtx
 	astcenc_context* ctx;
 };
 
+// The shared contexts are only ever used to COMPRESS (astcenc_decompress_image is never called), so they can be
+// created with ASTCENC_FLG_SELF_DECOMPRESS_ONLY (bit 5 in every astcenc release that has it): astcenc then drops the
+// block modes and partitionings its own compressor never produces. That means smaller lookup tables, a faster context
+// build and fewer cache misses while encoding, with the same encoder behaviour. An astcenc build that does not know
+// the flag rejects it and the plain flags are used instead. The cache key flags ('flags') are intentionally unchanged.
+#if defined( ASTCENC_FLG_SELF_DECOMPRESS_ONLY )
+static const uint32_t kAstcSelfDecompressOnly = ASTCENC_FLG_SELF_DECOMPRESS_ONLY;
+#else
+static const uint32_t kAstcSelfDecompressOnly = 1u << 5;
+#endif
+
 static std::mutex				s_ctxMutex;
 static std::vector<SharedCtx>	s_ctxs;
 static std::mutex				s_encodeMutex;	// an astcenc context must not be used by two calls at once
@@ -949,7 +994,9 @@ static astcenc_context* AcquireSharedContext( astcenc_profile profile, int bw, i
 	}
 
 	astcenc_config config;
-	astcenc_error status = astcenc_config_init( profile, bw, bh, 1, quality, flags, &config );
+	astcenc_error status = astcenc_config_init( profile, bw, bh, 1, quality, flags | kAstcSelfDecompressOnly, &config );
+	if ( status != ASTCENC_SUCCESS )
+		status = astcenc_config_init( profile, bw, bh, 1, quality, flags, &config );	// astcenc without that flag
 	if ( status != ASTCENC_SUCCESS )
 	{
 		Warning( "ASTC: astcenc_config_init(%dx%d) failed: %s\n", bw, bh, astcenc_get_error_string( status ) );
