@@ -35,7 +35,6 @@ extern "C" {
 #include "tier0/icommandline.h"
 #include "glmtexinlines.h"
 #include "astc_texcompress.h"
-#include "arm_neon_opt.h"		// NEON texel padding / conversion (AArch64 only; scalar fallback otherwise)
 #include "tier0/dbg.h"		// Warning() / Msg() / Error() for the ASTC upload diagnostics		// added: ASTC LDR/HDR runtime recompression for ARGB/RGBA formats
 
 // memdbgon -must- be the last include file in a .cpp file.
@@ -3791,10 +3790,7 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 			Error( "CompressedTexImage2D: out of memory padding a %dx%d texture\n", (int)width, (int)height );
 			return;
 		}
-		// AArch64: NEON pads 16 pixels per iteration (ld3 + st4); the scalar loop below does whatever is left
-		// (and everything on CPUs without the NEON path).
-		const size_t nVec = ArmOpt_U8ToRGBA( rgb, nPixels, ARMOPT_LAY_RGB, /*forceOpaque=*/1, paddedRGBA );
-		for ( size_t i = nVec; i < nPixels; ++i )
+		for ( size_t i = 0; i < nPixels; ++i )
 		{
 			paddedRGBA[i*4+0] = rgb[i*3+0];
 			paddedRGBA[i*4+1] = rgb[i*3+1];
