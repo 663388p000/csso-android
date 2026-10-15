@@ -172,7 +172,7 @@ ConVar gl_astc_cache( "gl_astc_cache", "1", FCVAR_ARCHIVE,
 	"1 = keep encoded ASTC blocks in a dynamic RAM cache, keyed by source pixels and encode parameters, so the same texture level is never encoded twice in one session. "
 	"Nothing is written to storage unless gl_astc_disk_cache is also 1." );
 
-ConVar gl_astc_disk_cache( "gl_astc_disk_cache", "0", FCVAR_ARCHIVE,
+ConVar gl_astc_disk_cache( "gl_astc_disk_cache", "1", FCVAR_ARCHIVE,
 	"0 (default) = ASTC textures live in RAM only, nothing is saved to storage; every launch encodes again. "
 	"1 = also keep a persistent second tier in the single file astc_cache/astc_cache.bin (much faster launches, uses storage). Applied at first use." );
 
