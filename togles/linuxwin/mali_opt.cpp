@@ -3,11 +3,17 @@
 // mali_opt.cpp
 //
 // See mali_opt.h. Contents:
-//   1. Mali detection
-//   2. dynamic loading of the few GL entry points that are not in TOGL's function table
+//   1. GPU identity: Vendor ID / Device ID found automatically (system properties, device nodes, GL strings) and handed to
+//      other code (environment variables, exported C functions, console command gl_gpu_info), plus the Mali-only guard
+//      (this build refuses to run on Qualcomm Adreno). Everything new in this section is self-contained: no other file needs
+//      to change, the existing MaliOpt_* API below is unchanged.
+//   2. Mali detection (MaliOpt_IsMali); helper that loads the few GL entry points that are not in TOGL's function table
 //   3. glInvalidateFramebuffer wrapper (skip tile write-back of dead depth/stencil)
 //   4. occlusion query target selection
 //   5. program binary cache (single append-only file, in-memory open-addressing index)
+//
+// Command line / environment switches added here:
+//   -gl_allow_adreno  or  TOGL_ALLOW_ADRENO=1    run on an Adreno GPU anyway (unsupported, for testing)
 //
 // NOTE: no std::unordered_map / std::mutex here on purpose. The NDK r10e libc++ headers used by this project
 // do not compile some of them (see the note in astc_texcompress.cpp); plain C structures and pthreads are used.
@@ -111,7 +117,825 @@ static void *MaliOpt_GetProc( const char *name )
 }
 
 //-----------------------------------------------------------------------------
-// 1. Detection
+// 1. GPU identity (Vendor ID / Device ID) and the Mali-only guard
+//
+// Source engine code wants PCI style ids (D3DADAPTER_IDENTIFIER9::VendorId / DeviceId). Android has no PCI bus, so they are
+// worked out here, automatically, in two steps:
+//   a) when the library is loaded, without any GL: system properties (ro.hardware.egl, ro.hardware.vulkan, ro.hardware,
+//      ro.soc.manufacturer), the GPU device nodes (/dev/mali0, /dev/kgsl-3d0) and, where the app is allowed to read it, the
+//      Mali kernel driver's sysfs "gpuinfo" file;
+//   b) as soon as TOGL's GL entry points exist: the GL_VENDOR / GL_RENDERER strings. They are authoritative and win over a).
+//
+// VendorID: the real PCI / Vulkan vendor id (ARM 0x13B5, Qualcomm 0x5143, NVIDIA 0x10DE, AMD 0x1002, Intel 0x8086, ...).
+// DeviceID: Mali and Adreno have no PCI device ids, so it is DERIVED: a 32 bit FNV-1a hash of the normalised GPU name
+//   ("MALI-G57 MC2"). It is stable between runs and differs between models / core counts, but it is NOT an official id.
+//   On Linux with a PCI GPU the real id from /sys/class/drm is used instead. TOGL_GPU_DEVICE_ID_SOURCE tells which one
+//   you got: "pci" or "name-hash" ("none" = unknown, value 0).
+//
+// The result is handed to other code in three ways:
+//   * environment variables (visible to every native library, to child processes and, through android.system.Os.getenv,
+//     to Java). Set when the library loads (system probe) and updated when the GL context exists:
+//       TOGL_GPU_VENDOR_ID=0x13B5  TOGL_GPU_DEVICE_ID=0x........  TOGL_GPU_DEVICE_ID_SOURCE=name-hash
+//       TOGL_GPU_VENDOR=ARM  TOGL_GPU_NAME="Mali-G57 MC2"  TOGL_GPU_BRAND=mali|adreno|other|unknown
+//       TOGL_GPU_SUPPORTED=1|0  TOGL_GPU_INFO_SOURCE=devnode|property|sysfs|pci|gl|conflict|none
+//       TOGL_GPU_HW_PRODUCT_ID=0x....      (Mali only, only when the kernel driver's gpuinfo could be read)
+//   * plain C functions exported by libtogl.so (declare them where you need them, or dlsym them):
+//       extern "C" unsigned int Togl_GetGpuVendorId( void );
+//       extern "C" unsigned int Togl_GetGpuDeviceId( void );
+//       extern "C" const char  *Togl_GetGpuName( void );
+//       extern "C" int          Togl_IsGpuSupported( void );     // 0 = this Mali-only build must not run on this GPU
+//   * the console command gl_gpu_info.
+//
+// Mali-only guard: this build is made for ARM Mali GPUs. On a Qualcomm Adreno GPU it refuses to run: the first time TOGL
+// reaches the code in this file (first shader program, query or Present; always after the GL context exists) the game is
+// stopped with a clear message (engine log, logcat and Error()). Other GPUs (PowerVR, the desktop GPU of a Linux test
+// machine, ...) keep working, only without the Mali optimizations. For testing on Adreno: -gl_allow_adreno on the command
+// line or TOGL_ALLOW_ADRENO=1 in the environment. A launcher that wants to decide earlier can read TOGL_GPU_SUPPORTED /
+// Togl_IsGpuSupported() right after loading the library.
+//-----------------------------------------------------------------------------
+
+#define MALIOPT_VENDOR_ARM			0x13B5u
+#define MALIOPT_VENDOR_QUALCOMM		0x5143u
+#define MALIOPT_VENDOR_NVIDIA		0x10DEu
+#define MALIOPT_VENDOR_AMD			0x1002u
+#define MALIOPT_VENDOR_INTEL		0x8086u
+#define MALIOPT_VENDOR_APPLE		0x106Bu
+#define MALIOPT_VENDOR_IMAGINATION	0x1010u
+
+#define MALIOPT_PROP_MAX			96		// >= PROP_VALUE_MAX (92) of bionic
+
+#if defined( __GNUC__ )
+	#define MALIOPT_EXPORT	extern "C" __attribute__(( visibility( "default" ) ))
+#else
+	#define MALIOPT_EXPORT	extern "C"
+#endif
+
+enum
+{
+	kMaliBrandUnknown = 0,
+	kMaliBrandMali,
+	kMaliBrandAdreno,
+	kMaliBrandOther
+};
+
+struct MaliGpuIdentity					// plain data; published snapshots of it are never modified or freed
+{
+	uint32_t	vendorId;				// PCI style vendor id, 0 = unknown
+	uint32_t	deviceId;				// 0 = unknown, see deviceIdSource
+	uint32_t	hwProductId;			// Mali: product id reported by the kernel driver (sysfs gpuinfo), 0 = not available
+	int			brand;					// kMaliBrand*
+	int			cores;					// shader cores (MC<n> / MP<n>), 0 = unknown
+	int			supported;				// 0 = this Mali-only build must not run on this GPU
+	char		vendorName[24];
+	char		name[80];
+	char		deviceIdSource[12];		// "none", "pci", "name-hash"
+	char		source[12];				// "none", "devnode", "property", "sysfs", "pci", "gl", "conflict"
+};
+
+struct MaliSysProbe						// raw facts collected from the system, before any decision
+{
+	char		egl[MALIOPT_PROP_MAX];			// ro.hardware.egl
+	char		vulkan[MALIOPT_PROP_MAX];		// ro.hardware.vulkan
+	char		hardware[MALIOPT_PROP_MAX];		// ro.hardware
+	char		bootHardware[MALIOPT_PROP_MAX];	// ro.boot.hardware
+	char		socMfr[MALIOPT_PROP_MAX];		// ro.soc.manufacturer
+	char		socModel[MALIOPT_PROP_MAX];		// ro.soc.model (informational)
+	char		platform[MALIOPT_PROP_MAX];		// ro.board.platform (informational)
+	bool		devMali;						// /dev/mali0 exists
+	bool		devKgsl;						// /dev/kgsl-3d0 exists
+	char		gpuinfo[160];					// first line of the Mali kernel driver's sysfs "gpuinfo", "" if not readable
+	uint32_t	drmVendor, drmDevice;			// PCI ids from /sys/class/drm (Linux desktop), 0 = none
+};
+
+// ---- small ASCII helpers (no locale, no <ctype.h>) ---------------------------------------------
+static inline char MaliLower( char c )		{ return ( c >= 'A' && c <= 'Z' ) ? (char)( c + 32 ) : c; }
+static inline char MaliUpper( char c )		{ return ( c >= 'a' && c <= 'z' ) ? (char)( c - 32 ) : c; }
+static inline bool MaliIsDigit( char c )	{ return c >= '0' && c <= '9'; }
+static inline bool MaliIsAlnum( char c )	{ return MaliIsDigit( c ) || ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ); }
+static inline bool MaliIsSpace( char c )	{ return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+static inline const char *MaliSafe( const char *s )	{ return s ? s : ""; }
+
+static const char *MaliStrIStr( const char *hay, const char *needle )		// case-insensitive strstr, NULL safe
+{
+	if ( !hay || !needle || !needle[0] )
+		return NULL;
+	const size_t nl = strlen( needle );
+	for ( ; *hay; ++hay )
+	{
+		size_t i = 0;
+		while ( i < nl && hay[i] && MaliLower( hay[i] ) == MaliLower( needle[i] ) )
+			++i;
+		if ( i == nl )
+			return hay;
+		if ( !hay[i] )
+			return NULL;				// the rest is shorter than the needle
+	}
+	return NULL;
+}
+
+static bool MaliEqualsI( const char *a, const char *b )
+{
+	if ( !a || !b )
+		return false;
+	for ( ; *a && *b; ++a, ++b )
+		if ( MaliLower( *a ) != MaliLower( *b ) )
+			return false;
+	return *a == *b;
+}
+
+// Copy with truncation. Leading / trailing blanks are dropped, control characters become blanks (the text ends up in
+// environment variables and log lines).
+static void MaliCopyClean( char *dst, size_t cap, const char *src )
+{
+	if ( !cap )
+		return;
+	dst[0] = 0;
+	if ( !src )
+		return;
+	while ( *src && MaliIsSpace( *src ) )
+		++src;
+	size_t n = 0;
+	for ( ; *src && n + 1 < cap; ++src, ++n )
+		dst[n] = ( (unsigned char)*src < 0x20 || (unsigned char)*src == 0x7F ) ? ' ' : *src;
+	while ( n > 0 && dst[n - 1] == ' ' )
+		--n;
+	dst[n] = 0;
+}
+
+static uint32_t MaliFnv32Upper( const char *s )		// FNV-1a over the upper-cased text; never returns 0
+{
+	uint32_t h = 2166136261u;
+	for ( ; s && *s; ++s )
+	{
+		h ^= (uint32_t)(uint8_t)MaliUpper( *s );
+		h *= 16777619u;
+	}
+	return h ? h : 1u;
+}
+
+// "0x13b5", "13B5" -> value. 0 if there are no hex digits or more than 8 of them.
+static uint32_t MaliParseHex( const char *s )
+{
+	if ( !s )
+		return 0;
+	while ( *s && MaliIsSpace( *s ) )
+		++s;
+	if ( s[0] == '0' && ( s[1] == 'x' || s[1] == 'X' ) )
+		s += 2;
+	uint32_t v = 0;
+	int nDigits = 0;
+	for ( ; ; ++s, ++nDigits )
+	{
+		const char c = MaliLower( *s );
+		uint32_t d;
+		if ( MaliIsDigit( c ) )						d = (uint32_t)( c - '0' );
+		else if ( c >= 'a' && c <= 'f' )			d = (uint32_t)( c - 'a' + 10 );
+		else										break;
+		if ( nDigits >= 8 )
+			return 0;
+		v = ( v << 4 ) | d;
+	}
+	return nDigits ? v : 0;
+}
+
+// Next run of letters / digits.
+static bool MaliNextToken( const char **pp, const char **tok, size_t *len )
+{
+	const char *p = *pp;
+	while ( *p && !MaliIsAlnum( *p ) )
+		++p;
+	if ( !*p )
+	{
+		*pp = p;
+		return false;
+	}
+	*tok = p;
+	while ( MaliIsAlnum( *p ) )
+		++p;
+	*len = (size_t)( p - *tok );
+	*pp = p;
+	return true;
+}
+
+// ---- Mali model names ---------------------------------------------------------------------------
+struct MaliName
+{
+	char	brand[16];		// "Mali" or "Immortalis"
+	char	family[24];		// upper case: "G57", "T880", "400", "G715"
+	int		cores;			// 0 = unknown
+};
+
+// "Mali-G57 MC2" -> Mali / G57 / 2.  Also "Immortalis-G715 MC11", "Mali-T880 MP12", "Mali-G52 2EE MC2", "Mali-G71 20 cores",
+// "Mali-400 MP". Anything else (no "Mali-" / "Immortalis-") returns false.
+static bool MaliParseName( const char *s, MaliName *out )
+{
+	memset( out, 0, sizeof( *out ) );
+	if ( !s )
+		return false;
+
+	const char *brand = "Mali";
+	size_t skip = 5;
+	const char *p = MaliStrIStr( s, "mali-" );
+	const char *q = MaliStrIStr( s, "immortalis-" );
+	if ( q && ( !p || q < p ) )
+	{
+		p = q;
+		brand = "Immortalis";
+		skip = 11;
+	}
+	if ( !p )
+		return false;
+	p += skip;
+
+	size_t n = 0;
+	while ( p[n] && ( MaliIsAlnum( p[n] ) || p[n] == '-' ) && n + 1 < sizeof( out->family ) )
+	{
+		out->family[n] = MaliUpper( p[n] );
+		++n;
+	}
+	out->family[n] = 0;
+	if ( n == 0 )
+		return false;
+	p += n;
+	snprintf( out->brand, sizeof( out->brand ), "%s", brand );
+
+	// the core count: a token MC<n> / MP<n>, or "<n> cores"
+	const char *tok = NULL;
+	size_t len = 0;
+	int prevNumber = 0;
+	while ( MaliNextToken( &p, &tok, &len ) )
+	{
+		int number = 0;
+		bool allDigits = true;
+		for ( size_t i = 0; i < len; ++i )
+		{
+			if ( !MaliIsDigit( tok[i] ) )
+			{
+				allDigits = false;
+				break;
+			}
+			if ( number < 100000 )
+				number = number * 10 + ( tok[i] - '0' );
+		}
+
+		if ( len >= 3 && MaliUpper( tok[0] ) == 'M' && ( MaliUpper( tok[1] ) == 'C' || MaliUpper( tok[1] ) == 'P' ) )
+		{
+			int v = 0;
+			bool ok = true;
+			for ( size_t i = 2; i < len && ok; ++i )
+			{
+				ok = MaliIsDigit( tok[i] );
+				if ( ok && v < 100000 )
+					v = v * 10 + ( tok[i] - '0' );
+			}
+			if ( ok && v > 0 && v <= 1024 )
+			{
+				out->cores = v;
+				break;
+			}
+		}
+		else if ( ( len == 5 && MaliStrIStr( tok, "cores" ) == tok ) || ( len == 4 && MaliStrIStr( tok, "core" ) == tok ) )
+		{
+			if ( prevNumber > 0 && prevNumber <= 1024 )
+			{
+				out->cores = prevNumber;
+				break;
+			}
+		}
+		prevNumber = allDigits ? number : 0;
+	}
+	return true;
+}
+
+// Normalised name used for the device id hash: "MALI-G57 MC2", "IMMORTALIS-G715".
+static void MaliBuildKey( const MaliName &n, char *out, size_t cap )
+{
+	char brand[sizeof( n.brand )];
+	size_t i = 0;
+	for ( ; n.brand[i] && i + 1 < sizeof( brand ); ++i )
+		brand[i] = MaliUpper( n.brand[i] );
+	brand[i] = 0;
+	if ( n.cores > 0 )
+		snprintf( out, cap, "%s-%s MC%d", brand, n.family, n.cores );
+	else
+		snprintf( out, cap, "%s-%s", brand, n.family );
+}
+
+// First line of the Mali kernel driver's "gpuinfo", e.g. "Mali-G57 MC2 r0p1 0x9091" or "Mali-G71 20 cores r0p0 0x6000".
+// The exact format differs between driver versions, so this only looks for a Mali model name and a 0x.... token.
+static bool MaliParseGpuInfo( const char *line, MaliName *name, uint32_t *hwProduct )
+{
+	*hwProduct = 0;
+	if ( !MaliParseName( line, name ) )
+		return false;
+	const char *p = line;
+	const char *tok = NULL;
+	size_t len = 0;
+	while ( MaliNextToken( &p, &tok, &len ) )
+	{
+		if ( len >= 3 && tok[0] == '0' && ( tok[1] == 'x' || tok[1] == 'X' ) )
+		{
+			char tmp[16];
+			if ( len < sizeof( tmp ) )
+			{
+				memcpy( tmp, tok, len );
+				tmp[len] = 0;
+				const uint32_t v = MaliParseHex( tmp );
+				if ( v )
+					*hwProduct = v;
+			}
+		}
+	}
+	return true;
+}
+
+static const char *MaliBrandName( int brand )
+{
+	switch ( brand )
+	{
+		case kMaliBrandMali:	return "mali";
+		case kMaliBrandAdreno:	return "adreno";
+		case kMaliBrandOther:	return "other";
+		default:				return "unknown";
+	}
+}
+
+static const char *MaliVendorName( uint32_t vendorId )
+{
+	switch ( vendorId )
+	{
+		case MALIOPT_VENDOR_ARM:			return "ARM";
+		case MALIOPT_VENDOR_QUALCOMM:		return "Qualcomm";
+		case MALIOPT_VENDOR_NVIDIA:			return "NVIDIA";
+		case MALIOPT_VENDOR_AMD:			return "AMD";
+		case MALIOPT_VENDOR_INTEL:			return "Intel";
+		case MALIOPT_VENDOR_APPLE:			return "Apple";
+		case MALIOPT_VENDOR_IMAGINATION:	return "Imagination";
+		default:							return "";
+	}
+}
+
+static uint32_t MaliVendorFromProvider( int provider )
+{
+	switch ( provider )
+	{
+		case cGLDriverProviderNVIDIA:			return MALIOPT_VENDOR_NVIDIA;
+		case cGLDriverProviderAMD:				return MALIOPT_VENDOR_AMD;
+		case cGLDriverProviderIntelOpenSource:	return MALIOPT_VENDOR_INTEL;
+		case cGLDriverProviderApple:			return MALIOPT_VENDOR_APPLE;
+		case cGLDriverProviderQualcomm:			return MALIOPT_VENDOR_QUALCOMM;
+		case cGLDriverProviderARM:				return MALIOPT_VENDOR_ARM;
+		case cGLDriverProviderImagination:		return MALIOPT_VENDOR_IMAGINATION;
+		default:								return 0;
+	}
+}
+
+// ---- reading the system -------------------------------------------------------------------------
+// The three functions below are the only places that touch the system; they are called through pointers so that the host
+// tests can feed in the properties / files of other devices.
+typedef int		( *MaliPFN_SysProp )( const char *name, char *value );					// value >= MALIOPT_PROP_MAX bytes; returns its length (0 = unset)
+typedef bool	( *MaliPFN_PathExists )( const char *path );
+typedef bool	( *MaliPFN_ReadFile )( const char *path, char *buf, size_t cap );		// NUL terminated, false if unreadable / empty
+
+#if MALIOPT_POSIX
+
+static int MaliReal_SysProp( const char *name, char *value )
+{
+	typedef int ( *PFN_PropGet )( const char *, char * );
+	static PFN_PropGet s_pfn = NULL;
+	static bool s_bTried = false;
+	value[0] = 0;
+	if ( !s_bTried )
+	{
+		s_pfn = (PFN_PropGet)dlsym( MALIOPT_RTLD_DEFAULT, "__system_property_get" );		// bionic only; NULL elsewhere
+		s_bTried = true;
+	}
+	if ( !s_pfn )
+		return 0;
+	const int n = s_pfn( name, value );
+	value[MALIOPT_PROP_MAX - 1] = 0;
+	if ( n <= 0 )
+	{
+		value[0] = 0;
+		return 0;
+	}
+	return n;
+}
+
+static bool MaliReal_PathExists( const char *path )
+{
+	struct stat st;
+	return stat( path, &st ) == 0;		// only a successful stat counts: "permission denied" proves nothing
+}
+
+static bool MaliReal_ReadFile( const char *path, char *buf, size_t cap )
+{
+	if ( !cap )
+		return false;
+	buf[0] = 0;
+	const int fd = open( path, O_RDONLY | O_CLOEXEC );
+	if ( fd < 0 )
+		return false;
+	size_t got = 0;
+	while ( got + 1 < cap )
+	{
+		const ssize_t r = read( fd, buf + got, cap - 1 - got );
+		if ( r < 0 && errno == EINTR )
+			continue;
+		if ( r <= 0 )
+			break;
+		got += (size_t)r;
+	}
+	close( fd );
+	buf[got] = 0;
+	return got > 0;
+}
+
+#else // !MALIOPT_POSIX
+
+static int MaliReal_SysProp( const char *, char *value )				{ value[0] = 0; return 0; }
+static bool MaliReal_PathExists( const char * )							{ return false; }
+static bool MaliReal_ReadFile( const char *, char *buf, size_t cap )	{ if ( cap ) buf[0] = 0; return false; }
+
+#endif // MALIOPT_POSIX
+
+static MaliPFN_SysProp		s_pfnSysProp	= MaliReal_SysProp;
+static MaliPFN_PathExists	s_pfnPathExists	= MaliReal_PathExists;
+static MaliPFN_ReadFile		s_pfnReadFile	= MaliReal_ReadFile;
+
+static void MaliProbeSystem( MaliSysProbe *p )
+{
+	memset( p, 0, sizeof( *p ) );
+
+	s_pfnSysProp( "ro.hardware.egl", p->egl );
+	s_pfnSysProp( "ro.hardware.vulkan", p->vulkan );
+	s_pfnSysProp( "ro.hardware", p->hardware );
+	s_pfnSysProp( "ro.boot.hardware", p->bootHardware );
+	s_pfnSysProp( "ro.soc.manufacturer", p->socMfr );
+	s_pfnSysProp( "ro.soc.model", p->socModel );
+	s_pfnSysProp( "ro.board.platform", p->platform );
+
+	// The userspace GL driver itself opens these nodes, so the app can always see them when the GPU is there.
+	p->devMali = s_pfnPathExists( "/dev/mali0" );
+	p->devKgsl = s_pfnPathExists( "/dev/kgsl-3d0" );
+
+	// Mali kernel driver: model + product id. Often not readable by apps (SELinux); then this stays empty.
+	if ( s_pfnReadFile( "/sys/class/misc/mali0/device/gpuinfo", p->gpuinfo, sizeof( p->gpuinfo ) ) )
+	{
+		for ( size_t i = 0; p->gpuinfo[i]; ++i )
+		{
+			if ( p->gpuinfo[i] == '\n' || p->gpuinfo[i] == '\r' )
+			{
+				p->gpuinfo[i] = 0;
+				break;
+			}
+		}
+	}
+
+	// Linux desktop: the real PCI ids.
+	for ( int i = 0; i < 4 && !p->drmVendor; ++i )
+	{
+		char path[64], buf[32];
+		snprintf( path, sizeof( path ), "/sys/class/drm/card%d/device/vendor", i );
+		if ( !s_pfnReadFile( path, buf, sizeof( buf ) ) )
+			continue;
+		const uint32_t vendor = MaliParseHex( buf );
+		if ( !vendor )
+			continue;
+		uint32_t device = 0;
+		snprintf( path, sizeof( path ), "/sys/class/drm/card%d/device/device", i );
+		if ( s_pfnReadFile( path, buf, sizeof( buf ) ) )
+			device = MaliParseHex( buf );
+		p->drmVendor = vendor;
+		p->drmDevice = device;
+	}
+}
+
+// ---- deciding -----------------------------------------------------------------------------------
+
+static void MaliFillName( MaliGpuIdentity *id, const MaliName &n )		// "Mali-G57 MC2"
+{
+	if ( n.cores > 0 )
+		snprintf( id->name, sizeof( id->name ), "%s-%s MC%d", n.brand, n.family, n.cores );
+	else
+		snprintf( id->name, sizeof( id->name ), "%s-%s", n.brand, n.family );
+	id->cores = n.cores;
+}
+
+// Step a): what the system says, no GL needed. Conflicting hints decide nothing (brand unknown): the guard never acts on
+// a guess, it only acts on the GL strings.
+static void MaliClassifySystem( const MaliSysProbe &p, MaliGpuIdentity *id )
+{
+	memset( id, 0, sizeof( *id ) );
+	snprintf( id->deviceIdSource, sizeof( id->deviceIdSource ), "none" );
+	snprintf( id->source, sizeof( id->source ), "none" );
+
+	MaliName gi;
+	memset( &gi, 0, sizeof( gi ) );
+	uint32_t hw = 0;
+	const bool bGpuInfo = p.gpuinfo[0] && MaliParseGpuInfo( p.gpuinfo, &gi, &hw );
+
+	const bool bAdreno =
+		p.devKgsl || MaliEqualsI( p.egl, "adreno" ) || MaliEqualsI( p.vulkan, "adreno" ) ||
+		MaliEqualsI( p.hardware, "qcom" ) || MaliEqualsI( p.bootHardware, "qcom" ) ||
+		MaliEqualsI( p.socMfr, "qti" ) || MaliStrIStr( p.socMfr, "qualcomm" ) != NULL;		// every Qualcomm SoC has an Adreno
+	const bool bMali = p.devMali || MaliEqualsI( p.egl, "mali" ) || MaliEqualsI( p.vulkan, "mali" ) || bGpuInfo;
+
+	if ( bMali && !bAdreno )
+	{
+		id->brand = kMaliBrandMali;
+		id->vendorId = MALIOPT_VENDOR_ARM;
+		snprintf( id->vendorName, sizeof( id->vendorName ), "ARM" );
+		snprintf( id->source, sizeof( id->source ), "%s", bGpuInfo ? "sysfs" : ( p.devMali ? "devnode" : "property" ) );
+		if ( bGpuInfo )
+		{
+			char key[64];
+			MaliFillName( id, gi );
+			MaliBuildKey( gi, key, sizeof( key ) );
+			id->deviceId = MaliFnv32Upper( key );
+			id->hwProductId = hw;
+			snprintf( id->deviceIdSource, sizeof( id->deviceIdSource ), "name-hash" );
+		}
+	}
+	else if ( bAdreno && !bMali )
+	{
+		id->brand = kMaliBrandAdreno;
+		id->vendorId = MALIOPT_VENDOR_QUALCOMM;
+		snprintf( id->vendorName, sizeof( id->vendorName ), "Qualcomm" );
+		snprintf( id->source, sizeof( id->source ), "%s", p.devKgsl ? "devnode" : "property" );
+	}
+	else if ( bAdreno && bMali )
+	{
+		snprintf( id->source, sizeof( id->source ), "conflict" );
+	}
+	else if ( p.drmVendor )
+	{
+		id->brand = kMaliBrandOther;
+		id->vendorId = p.drmVendor;
+		id->deviceId = p.drmDevice;
+		MaliCopyClean( id->vendorName, sizeof( id->vendorName ), MaliVendorName( p.drmVendor ) );
+		snprintf( id->source, sizeof( id->source ), "pci" );
+		if ( p.drmDevice )
+			snprintf( id->deviceIdSource, sizeof( id->deviceIdSource ), "pci" );
+	}
+}
+
+// Step b): the GL strings. 'early' is the result of step a); its Mali product id and PCI ids are kept when they still fit.
+static void MaliClassifyGL( const MaliGpuIdentity &early, int provider, const char *vendorStr, const char *rendererStr, MaliGpuIdentity *id )
+{
+	*id = early;
+	id->brand = kMaliBrandUnknown;
+	id->vendorId = 0;
+	id->deviceId = 0;
+	id->hwProductId = 0;
+	id->cores = 0;
+	id->vendorName[0] = 0;
+	snprintf( id->deviceIdSource, sizeof( id->deviceIdSource ), "none" );
+	snprintf( id->source, sizeof( id->source ), "gl" );
+	MaliCopyClean( id->name, sizeof( id->name ), rendererStr );
+
+	const bool bAdreno = provider == cGLDriverProviderQualcomm || MaliStrIStr( vendorStr, "qualcomm" ) != NULL || MaliStrIStr( rendererStr, "adreno" ) != NULL;
+	MaliName mn;
+	const bool bMaliName = MaliParseName( rendererStr, &mn );
+
+	if ( bAdreno )
+	{
+		id->brand = kMaliBrandAdreno;
+		id->vendorId = MALIOPT_VENDOR_QUALCOMM;
+	}
+	else if ( provider == cGLDriverProviderARM || bMaliName )
+	{
+		id->brand = kMaliBrandMali;
+		id->vendorId = MALIOPT_VENDOR_ARM;
+		if ( early.brand == kMaliBrandMali )
+			id->hwProductId = early.hwProductId;			// the kernel driver's product id, if the system probe could read it
+	}
+	else
+	{
+		id->brand = kMaliBrandOther;
+		id->vendorId = MaliVendorFromProvider( provider );
+	}
+	MaliCopyClean( id->vendorName, sizeof( id->vendorName ), MaliVendorName( id->vendorId ) );
+
+	if ( id->brand == kMaliBrandMali && bMaliName )
+	{
+		char key[64];
+		id->cores = mn.cores;
+		MaliBuildKey( mn, key, sizeof( key ) );
+		id->deviceId = MaliFnv32Upper( key );
+		snprintf( id->deviceIdSource, sizeof( id->deviceIdSource ), "name-hash" );
+	}
+	else if ( id->brand == kMaliBrandOther && strcmp( early.deviceIdSource, "pci" ) == 0 && early.vendorId == id->vendorId && early.deviceId )
+	{
+		id->deviceId = early.deviceId;												// real PCI id, same GPU
+		snprintf( id->deviceIdSource, sizeof( id->deviceIdSource ), "pci" );
+	}
+	else if ( id->name[0] )
+	{
+		id->deviceId = MaliFnv32Upper( id->name );
+		snprintf( id->deviceIdSource, sizeof( id->deviceIdSource ), "name-hash" );
+	}
+}
+
+// ---- policy -------------------------------------------------------------------------------------
+
+static bool MaliAdrenoOverride( bool bCommandLineReady )
+{
+	const char *e = getenv( "TOGL_ALLOW_ADRENO" );
+	if ( e && e[0] && e[0] != '0' )
+		return true;
+	return bCommandLineReady && CommandLine()->FindParm( "-gl_allow_adreno" ) != 0;
+}
+
+// ---- state, publishing ---------------------------------------------------------------------------
+
+#if MALIOPT_POSIX
+	static pthread_mutex_t s_idLock = PTHREAD_MUTEX_INITIALIZER;
+	struct MaliIdLock
+	{
+		MaliIdLock()	{ pthread_mutex_lock( &s_idLock ); }
+		~MaliIdLock()	{ pthread_mutex_unlock( &s_idLock ); }
+	};
+#else
+	struct MaliIdLock { MaliIdLock() {} ~MaliIdLock() {} };
+#endif
+
+static bool					s_bIdProbed = false;		// step a) done
+static bool					s_bIdGLDone = false;		// step b) done
+static MaliSysProbe			s_idProbe;
+static MaliGpuIdentity		s_idEarly;					// result of step a)
+static const MaliGpuIdentity *s_pIdCur = NULL;			// what everybody sees; replaced (never modified) when step b) is done
+static MaliGpuIdentity		s_idFallback;				// only used if malloc fails
+
+// Logcat, so the line is there even if the engine's log is not up yet (library constructor) or is lost in a crash.
+static void MaliAndroidLog( int prio, const char *text )		// prio: 4 = info, 5 = warning, 6 = error
+{
+#if MALIOPT_POSIX
+	typedef int ( *PFN_LogWrite )( int, const char *, const char * );
+	static PFN_LogWrite s_pfn = NULL;
+	static bool s_bTried = false;
+	if ( !s_bTried )
+	{
+		s_pfn = (PFN_LogWrite)dlsym( MALIOPT_RTLD_DEFAULT, "__android_log_write" );
+		s_bTried = true;
+	}
+	if ( s_pfn )
+		s_pfn( prio, "Togles", text );
+#else
+	(void)prio;
+	(void)text;
+#endif
+}
+
+static void MaliLogIdentity( const MaliGpuIdentity &id, bool bEngineLog )
+{
+	char line[360];
+	snprintf( line, sizeof( line ), "GPU identity (%s): \"%s\" vendor=%s id=0x%04X device id=0x%04X (%s) brand=%s supported=%d",
+		id.source, id.name, id.vendorName[0] ? id.vendorName : "?", (unsigned)id.vendorId, (unsigned)id.deviceId,
+		id.deviceIdSource, MaliBrandName( id.brand ), id.supported );
+	MaliAndroidLog( 4, line );
+	if ( bEngineLog )
+		Msg( "%s\n", line );
+}
+
+static void MaliPublishEnv( const MaliGpuIdentity &id )
+{
+#if MALIOPT_POSIX
+	char v[24];
+	snprintf( v, sizeof( v ), "0x%04X", (unsigned)id.vendorId );
+	setenv( "TOGL_GPU_VENDOR_ID", v, 1 );
+	snprintf( v, sizeof( v ), "0x%04X", (unsigned)id.deviceId );
+	setenv( "TOGL_GPU_DEVICE_ID", v, 1 );
+	setenv( "TOGL_GPU_DEVICE_ID_SOURCE", id.deviceIdSource, 1 );
+	if ( id.hwProductId )
+	{
+		snprintf( v, sizeof( v ), "0x%04X", (unsigned)id.hwProductId );
+		setenv( "TOGL_GPU_HW_PRODUCT_ID", v, 1 );
+	}
+	else
+	{
+		unsetenv( "TOGL_GPU_HW_PRODUCT_ID" );
+	}
+	setenv( "TOGL_GPU_VENDOR", id.vendorName, 1 );
+	setenv( "TOGL_GPU_NAME", id.name, 1 );
+	setenv( "TOGL_GPU_BRAND", MaliBrandName( id.brand ), 1 );
+	setenv( "TOGL_GPU_SUPPORTED", id.supported ? "1" : "0", 1 );
+	setenv( "TOGL_GPU_INFO_SOURCE", id.source, 1 );
+#else
+	(void)id;
+#endif
+}
+
+// Snapshots are tiny and there are at most two per process; they are never freed so a pointer handed out once stays valid.
+static const MaliGpuIdentity *MaliMakeSnapshot( const MaliGpuIdentity &src, bool bCommandLineReady )
+{
+	MaliGpuIdentity *p = (MaliGpuIdentity *)malloc( sizeof( MaliGpuIdentity ) );
+	if ( !p )
+		p = &s_idFallback;
+	*p = src;
+	p->supported = ( p->brand != kMaliBrandAdreno || MaliAdrenoOverride( bCommandLineReady ) ) ? 1 : 0;
+	return p;
+}
+
+// The identity as far as it is known right now. Detects on first use (system probe) and refines as soon as the GL strings
+// exist. Never returns NULL; the result is immutable. Thread safe; does not call into the engine while holding the lock.
+static const MaliGpuIdentity *MaliOpt_Identity()
+{
+	bool bLogSystem = false, bLogGL = false;
+	int nSystemBrand = kMaliBrandUnknown;
+	const MaliGpuIdentity *cur;
+
+	{
+		MaliIdLock lk;
+		if ( !s_bIdProbed )
+		{
+			MaliProbeSystem( &s_idProbe );
+			MaliClassifySystem( s_idProbe, &s_idEarly );
+			s_pIdCur = MaliMakeSnapshot( s_idEarly, false );		// the command line may not exist yet (library constructor)
+			MaliPublishEnv( *s_pIdCur );
+			s_bIdProbed = true;
+			bLogSystem = true;
+		}
+		if ( gGL && !s_bIdGLDone )
+		{
+			MaliGpuIdentity gl;
+			MaliClassifyGL( s_idEarly, gGL->m_nDriverProvider, gGL->m_pGLDriverStrings[cGLVendorString], gGL->m_pGLDriverStrings[cGLRendererString], &gl );
+			nSystemBrand = s_idEarly.brand;
+			s_pIdCur = MaliMakeSnapshot( gl, true );
+			MaliPublishEnv( *s_pIdCur );
+			s_bIdGLDone = true;
+			bLogGL = true;
+		}
+		cur = s_pIdCur;
+	}
+
+	if ( bLogGL )
+	{
+		MaliLogIdentity( *cur, true );
+		if ( nSystemBrand != kMaliBrandUnknown && nSystemBrand != cur->brand )
+			Warning( "Togles: the system probe guessed GPU brand \"%s\" but the GL driver says \"%s\"; using the GL driver's answer.\n",
+				MaliBrandName( nSystemBrand ), MaliBrandName( cur->brand ) );
+	}
+	else if ( bLogSystem )
+	{
+		MaliLogIdentity( *cur, false );				// may run from the library constructor: logcat only
+	}
+	return cur;
+}
+
+MALIOPT_EXPORT unsigned int Togl_GetGpuVendorId( void )		{ return MaliOpt_Identity()->vendorId; }
+MALIOPT_EXPORT unsigned int Togl_GetGpuDeviceId( void )		{ return MaliOpt_Identity()->deviceId; }
+MALIOPT_EXPORT const char  *Togl_GetGpuName( void )			{ return MaliOpt_Identity()->name; }
+MALIOPT_EXPORT int          Togl_IsGpuSupported( void )		{ return MaliOpt_Identity()->supported; }
+
+#if MALIOPT_POSIX
+// Runs when libtogl.so is loaded: publishes the environment variables early, before any GL exists. Only libc is used here
+// (the engine is not initialised yet), and nothing in it can fail the load.
+static void MaliOpt_OnLoad() __attribute__(( constructor ));
+static void MaliOpt_OnLoad()
+{
+	MaliOpt_Identity();
+}
+#endif
+
+// Called before the first use of any Mali feature (so: after the GL context exists). Stops the game on a GPU this build
+// does not support. Idempotent.
+static void MaliOpt_CheckGpuPolicy()
+{
+	static bool s_bChecked = false;
+	if ( s_bChecked || !gGL )
+		return;
+	s_bChecked = true;
+
+	const MaliGpuIdentity *id = MaliOpt_Identity();				// includes the GL strings now
+	if ( id->brand == kMaliBrandAdreno )
+	{
+		if ( id->supported )
+		{
+			Warning( "Togles: Adreno GPU \"%s\" detected. This Togles build is made for ARM Mali GPUs only; it keeps running because of "
+				"-gl_allow_adreno / TOGL_ALLOW_ADRENO (unsupported).\n", id->name );
+			return;
+		}
+
+		char msg[420];
+		snprintf( msg, sizeof( msg ),
+			"This Togles build is made for ARM Mali GPUs only, but this device has a Qualcomm Adreno GPU (\"%s\"). Togles does not run on Adreno. "
+			"Use the renderer that supports Adreno. (Testing only: add -gl_allow_adreno to the command line or set TOGL_ALLOW_ADRENO=1.)",
+			id->name );
+		MaliAndroidLog( 6, msg );
+		Error( "Togles: %s\n", msg );							// does not return
+#if MALIOPT_POSIX
+		_exit( 3 );												// in case an Error() handler ever returns: Togles must not go on
+#endif
+	}
+	else if ( id->brand != kMaliBrandMali )
+	{
+		Msg( "Togles: GPU \"%s\" is not an ARM Mali GPU: the Mali optimizations stay off, everything else works as usual.\n", id->name );
+	}
+}
+
+//-----------------------------------------------------------------------------
+// 2. Mali detection
 //-----------------------------------------------------------------------------
 
 bool MaliOpt_IsMali()
@@ -122,11 +946,15 @@ bool MaliOpt_IsMali()
 		if ( !gGL )
 			return false;				// too early, ask again later
 
+		MaliOpt_CheckGpuPolicy();		// Adreno: does not return
+
 		s_nState = 0;
 		if ( gGL->m_nDriverProvider == cGLDriverProviderARM && gl_mali_opt.GetBool() && !CommandLine()->FindParm( "-gl_no_mali_opt" ) )
 			s_nState = 1;
 
-		Msg( "Mali optimizations: %s (GL_VENDOR=\"%s\")\n", s_nState ? "ENABLED" : "disabled", gGL->m_pGLDriverStrings[cGLVendorString] );
+		const MaliGpuIdentity *id = MaliOpt_Identity();
+		Msg( "Mali optimizations: %s (GL_VENDOR=\"%s\", GPU \"%s\", VendorID 0x%04X, DeviceID 0x%04X)\n", s_nState ? "ENABLED" : "disabled",
+			MaliSafe( gGL->m_pGLDriverStrings[cGLVendorString] ), id->name, (unsigned)id->vendorId, (unsigned)id->deviceId );
 	}
 	return s_nState > 0;
 }
@@ -519,8 +1347,8 @@ namespace
 		// The cache is only valid for the exact driver that wrote it.
 		char env[1024];
 		const int envLen = snprintf( env, sizeof( env ), "%s|%s|%s|v%u|%d",
-			gGL->m_pGLDriverStrings[cGLVendorString], gGL->m_pGLDriverStrings[cGLRendererString],
-			gGL->m_pGLDriverStrings[cGLVersionString], kFileVersion, nFormats );
+			MaliSafe( gGL->m_pGLDriverStrings[cGLVendorString] ), MaliSafe( gGL->m_pGLDriverStrings[cGLRendererString] ),
+			MaliSafe( gGL->m_pGLDriverStrings[cGLVersionString] ), kFileVersion, nFormats );
 		uint64_t envHash = MaliHash64( env, envLen > 0 ? (size_t)envLen : 0, 0x454E5631ULL );
 		envHash = MaliHash64( formats, sizeof( int ) * (size_t)nKeep, envHash );
 		s_pc.envHash = envHash;
@@ -609,6 +1437,8 @@ bool MaliOpt_ProgramCacheActive()
 		return s_pc.state > 0;
 	if ( !gGL )
 		return false;			// no GL yet; decide later
+
+	MaliOpt_CheckGpuPolicy();	// Adreno: does not return (also covers -gl_progcache_all, which skips MaliOpt_IsMali())
 
 	Lock lk;
 	if ( s_pc.state == 0 )
@@ -745,6 +1575,10 @@ void MaliOpt_ProgramStore( unsigned int program, uint64_t key )
 CON_COMMAND( gl_mali_stats, "Print the Mali optimization statistics (program binary cache)." )
 {
 	ConMsg( "Mali optimizations: %s\n", MaliOpt_IsMali() ? "enabled" : "disabled / not a Mali GPU" );
+	{
+		const MaliGpuIdentity *id = MaliOpt_Identity();
+		ConMsg( "GPU: \"%s\"  VendorID 0x%04X  DeviceID 0x%04X  (gl_gpu_info for details)\n", id->name, (unsigned)id->vendorId, (unsigned)id->deviceId );
+	}
 	if ( s_pc.state <= 0 )
 	{
 		ConMsg( "Program binary cache: off\n" );
@@ -768,3 +1602,29 @@ void MaliOpt_ProgramPrepareLink( unsigned int )						{}
 void MaliOpt_ProgramStore( unsigned int, uint64_t )					{}
 
 #endif // MALIOPT_POSIX
+
+CON_COMMAND( gl_gpu_info, "Print the GPU identity Togles detected (VendorID / DeviceID) and whether this Mali-only build supports it." )
+{
+	const MaliGpuIdentity *id = MaliOpt_Identity();
+	const char *e;
+
+	ConMsg( "GPU: \"%s\" (%s)\n", id->name[0] ? id->name : "unknown", id->vendorName[0] ? id->vendorName : "unknown vendor" );
+	ConMsg( "  VendorID  = 0x%04X\n", (unsigned)id->vendorId );
+	ConMsg( "  DeviceID  = 0x%04X  (%s)\n", (unsigned)id->deviceId,
+		strcmp( id->deviceIdSource, "pci" ) == 0 ? "real PCI id" :
+		strcmp( id->deviceIdSource, "name-hash" ) == 0 ? "derived from the GPU name, not an official id" : "unknown" );
+	if ( id->hwProductId )
+		ConMsg( "  kernel GPU product id = 0x%04X\n", (unsigned)id->hwProductId );
+	if ( id->cores )
+		ConMsg( "  shader cores = %d\n", id->cores );
+	ConMsg( "  brand = %s, found by = %s\n", MaliBrandName( id->brand ), id->source );
+	ConMsg( "  supported by this Mali-only build: %s%s\n", id->supported ? "yes" : "NO",
+		( id->brand == kMaliBrandAdreno && id->supported ) ? " (Adreno allowed by -gl_allow_adreno / TOGL_ALLOW_ADRENO)" : "" );
+
+	e = getenv( "TOGL_GPU_VENDOR_ID" );
+	ConMsg( "  environment: TOGL_GPU_VENDOR_ID=%s", e ? e : "(unset)" );
+	e = getenv( "TOGL_GPU_DEVICE_ID" );
+	ConMsg( " TOGL_GPU_DEVICE_ID=%s", e ? e : "(unset)" );
+	e = getenv( "TOGL_GPU_SUPPORTED" );
+	ConMsg( " TOGL_GPU_SUPPORTED=%s\n", e ? e : "(unset)" );
+}
