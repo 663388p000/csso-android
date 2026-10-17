@@ -765,7 +765,8 @@ static bool					s_bIdGLDone = false;		// step b) done
 static MaliSysProbe			s_idProbe;
 static MaliGpuIdentity		s_idEarly;					// result of step a)
 static const MaliGpuIdentity *s_pIdCur = NULL;			// what everybody sees; replaced (never modified) when step b) is done
-static MaliGpuIdentity		s_idFallback;				// only used if malloc fails
+static MaliGpuIdentity		s_idSnap[4];				// storage of the published snapshots (at most two per process)
+static unsigned				s_nIdSnap = 0;
 
 // Logcat, so the line is there even if the engine's log is not up yet (library constructor) or is lost in a crash.
 static void MaliAndroidLog( int prio, const char *text )		// prio: 4 = info, 5 = warning, 6 = error
@@ -826,12 +827,12 @@ static void MaliPublishEnv( const MaliGpuIdentity &id )
 #endif
 }
 
-// Snapshots are tiny and there are at most two per process; they are never freed so a pointer handed out once stays valid.
+// There are at most two snapshots per process (system probe, then GL strings). They live in static storage and are never
+// modified once published, so a pointer handed out once stays valid (no malloc, nothing to fail or to leak). Called with the
+// identity lock held. The ring only wraps around in tests that reset the state.
 static const MaliGpuIdentity *MaliMakeSnapshot( const MaliGpuIdentity &src, bool bCommandLineReady )
 {
-	MaliGpuIdentity *p = (MaliGpuIdentity *)malloc( sizeof( MaliGpuIdentity ) );
-	if ( !p )
-		p = &s_idFallback;
+	MaliGpuIdentity *p = &s_idSnap[s_nIdSnap++ % 4];
 	*p = src;
 	p->supported = ( p->brand != kMaliBrandAdreno || MaliAdrenoOverride( bCommandLineReady ) ) ? 1 : 0;
 	return p;
@@ -1359,7 +1360,11 @@ namespace
 		mkdir( dir, 0755 );		// EEXIST is fine
 
 		char path[1200];
-		snprintf( path, sizeof( path ), "%s/progcache.bin", dir );
+		if ( snprintf( path, sizeof( path ), "%s/progcache.bin", dir ) >= (int)sizeof( path ) )
+		{
+			Warning( "Mali program cache: gl_mali_progcache_dir is too long, cache off\n" );		// a cut-off path could name another file
+			return false;
+		}
 		int fd = open( path, O_RDWR | O_CREAT | O_CLOEXEC, 0644 );
 		if ( fd < 0 )
 		{
@@ -1398,6 +1403,7 @@ namespace
 
 		// Index the records. A damaged tail is cut off.
 		uint64_t off = kHeaderBytes;
+		bool bIndexOom = false;
 		while ( off + kRecHdrBytes <= fileSize )
 		{
 			RecHeader rh;
@@ -1407,10 +1413,20 @@ namespace
 			if ( rh.magic != kRecMagic || rh.key == 0 || rh.dataLen == 0 || rh.dataLen > kMaxBinaryBytes || off + total > fileSize )
 				break;
 			if ( !TablePut( rh.key, off + kRecHdrBytes, rh.dataHash, rh.dataLen, rh.format ) )
+			{
+				bIndexOom = true;			// out of memory is not damage: the file must not be touched
 				break;
+			}
 			off += total;
 		}
-		if ( off < fileSize )
+		if ( bIndexOom )
+		{
+			// Use what was indexed so far, read-only: appending behind an incomplete index would lose the rest of the file.
+			Warning( "Mali program cache: out of memory while reading %s, using %u program(s), the file is left as it is\n", path, s_pc.count );
+			s_pc.storeOff = true;
+			off = fileSize;
+		}
+		else if ( off < fileSize )
 		{
 			Msg( "Mali program cache: dropping %llu damaged byte(s) at the end of %s\n", (unsigned long long)( fileSize - off ), path );
 			if ( ftruncate( fd, (off_t)off ) != 0 )
