@@ -31,7 +31,9 @@
 // memdbgon -must- be the last include file in a .cpp file.
 #include "tier0/memdbgon.h"
 
-// 7LS TODO : took out cmdline here
+// The command line is not read in these static initializers (the commented-out expressions show what the original Valve code did
+// here via Plat_GetCommandLineA(); it was taken out for this port). The switches that flip the two defaults
+// (-gl_enable_pseudobufs, -gl_enable_static_buffer) are handled in the COpenGLEntryPoints setup in glentrypoints.cpp instead.
 bool g_bUsePseudoBufs = false; //( Plat_GetCommandLineA() ) ? ( strstr( Plat_GetCommandLineA(), "-gl_enable_pseudobufs" ) != NULL ) : false;
 #ifdef OSX
 // Significant perf degradation on some OSX parts if static buffers not disabled
@@ -285,11 +287,12 @@ void CGLMBufferSpanManager::DiscardAllSpans()
 	Assert( !m_nTotalBytesAllocated );
 }
 
-// TODO: Add logic to detect incorrect usage of bNoOverwrite.
+// bNoOverwrite is D3DLOCK_NOOVERWRITE: the caller promises not to touch any part of the buffer that was locked since the last
+// discard, so the GPU can keep reading the earlier data. A lock that overlaps an active span while this flag is set breaks
+// that promise (the earlier data really does get overwritten) - that is reported as misuse below, not just as a slow path.
 CGLMBufferSpanManager::ActiveSpan_t *CGLMBufferSpanManager::AddSpan( uint nOffset, uint nMaxSize, uint nActualSize, bool bDiscard, bool bNoOverwrite  )
 {
 	(void)bDiscard;
-	(void)bNoOverwrite;
 
 	const uint nStart = nOffset;
 	const uint nSize = nActualSize;
@@ -315,11 +318,17 @@ CGLMBufferSpanManager::ActiveSpan_t *CGLMBufferSpanManager::AddSpan( uint nOffse
 				continue;
 			}
 
-			Warning( "GL performance warning: AddSpan() at offset %u max size %u actual size %u, on a %s %s buffer of total size %u, overwrites an existing active lock span at offset %u size %u!\n", 
-				nOffset, nMaxSize, nActualSize, 
-				m_bDynamic ? "dynamic" : "static", ( m_nBufType == kGLMVertexBuffer ) ? "vertex" : "index", m_nBufSize, 
-				existingSpan.m_nStart, existingSpan.m_nEnd - existingSpan.m_nStart );
-			
+			// A NOOVERWRITE misuse can repeat every frame, so only the first few are reported; the plain overlap keeps its old behavior.
+			static int s_nNoOverwriteMisuseReports = 0;
+			if ( !bNoOverwrite || ( s_nNoOverwriteMisuseReports++ < 32 ) )
+			{
+				Warning( "GL %s: AddSpan() at offset %u max size %u actual size %u, on a %s %s buffer of total size %u, overwrites an existing active lock span at offset %u size %u!\n",
+					bNoOverwrite ? "error (D3DLOCK_NOOVERWRITE used on a region that was already locked since the last discard)" : "performance warning",
+					nOffset, nMaxSize, nActualSize,
+					m_bDynamic ? "dynamic" : "static", ( m_nBufType == kGLMVertexBuffer ) ? "vertex" : "index", m_nBufSize,
+					existingSpan.m_nStart, existingSpan.m_nEnd - existingSpan.m_nStart );
+			}
+
 			if ( ( nStart <= existingSpan.m_nStart ) && ( nEnd >= existingSpan.m_nEnd ) )
 			{
 				if ( existingSpan.m_bOriginalAlloc )
@@ -902,6 +911,15 @@ void CGLMBuffer::Lock( GLMBuffLockParams *pParams, char **pAddressOut )
 		// Ensure the right GL buffer is bound before drawing (and vertex attribs properly set)
 		m_nRevision++;
 		m_bUsingPersistentBuffer = bUsingPersistentBuffer;
+	}
+
+	if ( !resultPtr )
+	{
+		// The driver could not map the range (glMapBufferRange() returned NULL). Nothing is mapped, so do not leave the buffer
+		// in the "locked" state - no later lock could ever succeed. The caller gets no address and has to treat the lock as failed
+		// (IDirect3DVertexBuffer9::Lock / IDirect3DIndexBuffer9::Lock report D3DERR_INVALIDCALL).
+		DXABSTRACT_BREAK_ON_ERROR();
+		return;
 	}
 
 	m_bMapped = true;
