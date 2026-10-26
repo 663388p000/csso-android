@@ -583,7 +583,10 @@ bool D3DToGL::OpenIntrinsic( uint32 inst, char* buff, int nBufLen, uint32 destDi
 		case D3DSIO_ELSE:
 		case D3DSIO_ENDIF:
 		case D3DSIO_BREAK:
-		case D3DSIO_BREAKC:		// TODO: these are the reason we even need GLSL...gotta make these work
+		case D3DSIO_BREAKC:
+			// Flow control is not an intrinsic: TranslateShader() emits rep/endrep/if/ifc/else/endif/break/breakc itself (see
+			// Handle_BREAKC() and the D3DSIO_REP...D3DSIO_BREAK cases there), and OpenIntrinsic() is only reached for the binary ops that
+			// go through HandleBinaryOp_GLSL(). So getting here for one of these opcodes is a translator bug, hence the error.
 			TranslationError();
 			break;
 		case D3DSIO_DEFB:
@@ -2340,7 +2343,11 @@ void D3DToGL::Handle_DEF()
 	//TestFloatConversion();
 
 	//
-	// JasonM TODO: catch D3D's sincos-specific D3DSINCOSCONST1 and D3DSINCOSCONST2 constants and filter them out here
+	// Shaders that use sincos (vs_2_x / ps_2_x) also "def" D3D's two sincos-specific Taylor series constants (D3DSINCOSCONST1 and
+	// D3DSINCOSCONST2) and pass them to the instruction. They are deliberately not filtered out here: Handle_SINCOS() skips those two
+	// operands and works from the scA/scB constants the translator declares itself, so the shader's own copies end up as unused
+	// locals that the GLSL compiler drops. A register can't be dropped at its "def" anyway, since nothing at this point says whether
+	// the shader also reads the same constant register for something else.
 	//
 
 	// Which register is being defined
@@ -2875,6 +2882,49 @@ void D3DToGL::Handle_NRM()
 	PrintToBufWithIndents( *m_pBufALUCode, "%s = normalize( %s );\n", pDestReg, sSrc.String() );
 }
 
+// sgn dst, src0 [, src1, src2]  (vertex shaders only)
+//
+// Per component: dst = ( src0 < 0 ) ? -1 : ( src0 > 0 ) ? 1 : 0, which is exactly what GLSL's sign() returns.
+//
+// vs_2_0 / vs_2_x also encode two scratch temporaries (src1 and src2) as extra operands. Those exist because hardware of that era had to
+// expand the instruction; their contents are undefined after the instruction, GLSL needs no workspace and nothing may read them back, so they
+// are just skipped. The number of operand tokens comes from the length field of the opcode token instead of from the shader version, so
+// this handles the 2.x (dst, src0, src1, src2) and the 3.0 (dst, src0) encodings alike - and any relative-addressing tokens inside them.
+void D3DToGL::Handle_SGN( uint32 dwToken )
+{
+	uint32 *pFirstOperandToken = m_pdwNextToken;
+	uint32 nOperandTokens = ( dwToken & D3DSI_INSTLENGTH_MASK ) >> D3DSI_INSTLENGTH_SHIFT;
+
+	uint32 nDestToken = GetNextToken();
+	CUtlString sDest = GetParameterString( nDestToken, DST_REGISTER, false, NULL );
+	int nARLComp0 = ARL_DEST_NONE;
+	CUtlString sSrc0 = GetParameterString( GetNextToken(), SRC_REGISTER, false, &nARLComp0 );
+
+	// This optionally inserts a move from our dummy address register to the .x component of the real one
+	InsertMoveFromAddressRegister( m_pBufALUCode, nARLComp0, ARL_DEST_NONE );
+
+	// Make the number of source components match the dest write mask
+	sSrc0 = FixGLSLSwizzle( sDest, sSrc0 );
+
+	PrintToBufWithIndents( *m_pBufALUCode, "%s = sign( %s );\n", sDest.String(), sSrc0.String() );
+
+	// If the _SAT instruction modifier is used, then do a saturate here.
+	if ( nDestToken & D3DSPDM_SATURATE )
+	{
+		int nComponents = GetNumSwizzleComponents( sDest.String() );
+		if ( nComponents == 0 )
+		{
+			nComponents = 4;
+		}
+
+		PrintToBufWithIndents( *m_pBufALUCode, "%s = clamp( %s, %s, %s );\n", sDest.String(), sDest.String(), g_szVecZeros[nComponents], g_szVecOnes[nComponents] );
+	}
+
+	// Skip the scratch operands (if any). We must not have consumed more than the instruction says it has.
+	Assert( m_pdwNextToken <= pFirstOperandToken + nOperandTokens );
+	m_pdwNextToken = pFirstOperandToken + nOperandTokens;
+}
+
 void D3DToGL::Handle_UnaryOp( uint32 nInstruction )
 {
 	uint32 nDestToken = GetNextToken();
@@ -3352,11 +3402,21 @@ int D3DToGL::TranslateShader( uint32* code, CUtlBuffer *pBufDisassembledCode, bo
 			case D3DSIO_PHASE:
 			case D3DSIO_RET:
 			case D3DSIO_ENDLOOP:
-			case D3DSIO_BREAK:
 				TranslationError();
 				PrintOpcode( nInstruction, buff, sizeof( buff ) );
 				StrcatToALUCode( buff );
 				StrcatToALUCode( ";\n" );
+				break;
+
+			case D3DSIO_BREAK:
+				// Unconditional exit from the enclosing rep/endrep loop (D3D only allows this inside a loop, normally inside an if block).
+				// The conditional form is handled by Handle_BREAKC().
+				if ( m_nLoopDepth < 1 )
+				{
+					TranslationError();
+				}
+
+				PrintToBufWithIndents( *m_pBufALUCode, "break;\n" );
 				break;
 
 			// -- "Declarative" non dcl ops ----------------------------------------
@@ -3449,22 +3509,25 @@ int D3DToGL::TranslateShader( uint32* code, CUtlBuffer *pBufDisassembledCode, bo
 				break;
 
 			case D3DSIO_REP:
+			{
 				dwToken = GetNextToken();
 				PrintParameterToString( dwToken, SRC_REGISTER, buff, sizeof( buff ), false, NULL );
 
+				// rep/endrep never exposes its counter to the loop body (that is what loop/aL is for), so each nesting level just needs a loop
+				// variable of its own so nested loops don't collide: i, j, k, l (D3D9 allows at most 4 nested loops). Should a shader nest deeper,
+				// the last name is reused: GLSL lets the inner loop shadow the outer one's variable, which is harmless for the same reason.
+				static const char s_szLoopVarNames[] = "ijkl";
+				const char chLoopVar = s_szLoopVarNames[ MIN( m_nLoopDepth, (int)( sizeof( s_szLoopVarNames ) - 2 ) ) ];
+
 				// In practice, this is the only form of for loop that will appear in DX asm
-				PrintToBufWithIndents( *m_pBufALUCode, "for( int i=0; i < %s; i++ )\n", buff );
+				PrintToBufWithIndents( *m_pBufALUCode, "for( int %c=0; %c < %s; %c++ )\n", chLoopVar, chLoopVar, buff, chLoopVar );
 				StrcatToALUCode( "{\n" );
 
 				m_nLoopDepth++;
-
-				// For now, we don't deal with loop nesting
-				// Easy enough to fix later with an array of loop names i, j, k etc
-				Assert( m_nLoopDepth <= 1 );
-
 				m_NumIndentTabs++;
-				
+
 				break;
+			}
 
 			case D3DSIO_ENDREP:
 				m_nLoopDepth--;
@@ -3539,7 +3602,7 @@ int D3DToGL::TranslateShader( uint32* code, CUtlBuffer *pBufDisassembledCode, bo
 				break;
 			case D3DSIO_SGN:
 				Assert( m_bVertexShader );
-				TranslationError();		// TODO emulate with SLT etc
+				Handle_SGN( dwToken );
 				break;
 			case D3DSIO_CND:
 				TranslationError();
@@ -3730,7 +3793,9 @@ int D3DToGL::TranslateShader( uint32* code, CUtlBuffer *pBufDisassembledCode, bo
 		}
 	}
 
-	if ( m_bVertexShader && (m_bDoUserClipPlanes || m_bDoFixupZ  || m_bDoFixupY ) )
+	// vTempPos is what the translated code calls the vertex shader's position output; it is copied to gl_Position at the end of main(),
+	// so it has to exist whenever the shader writes a position, whichever fixup options were requested.
+	if ( m_bVertexShader && ( m_bDeclareVSOPos || m_bDoUserClipPlanes || m_bDoFixupZ  || m_bDoFixupY ) )
 	{
 		PrintIndentation( (char*)m_pBufParamCode->Base(), m_pBufParamCode->Size() );
 		StrcatToParamCode( "vec4 vTempPos;\n" );
@@ -3776,18 +3841,17 @@ int D3DToGL::TranslateShader( uint32* code, CUtlBuffer *pBufDisassembledCode, bo
 		
 	if ( m_bDeclareVSOPos && m_bVertexShader )
 	{
-		if ( m_bDoUserClipPlanes )
-		{
-//			StrcatToALUCode( "gl_ClipVertex = vTempPos;\n" ); // if user clip is enabled, jam clip space position into gl_ClipVertex
-		}
-		
+		// User clip planes (D3DToGL_OptionDoUserClipPlanes) are accepted but deliberately produce no clip output here:
+		//  - GLES has no gl_ClipVertex, and gl_ClipDistance is only available through GL_EXT_clip_cull_distance (not core GLES 3.2).
+		//  - The plane equations never reach GL in this port: GLContextSetIndexed( GLClipPlaneEquation_t * ) in glmgr.h has an empty body.
+		//  - IDirect3DDevice9::CreateVertexShader() only passes the option when GLMDisplayCaps::m_hasNativeClipVertexMode is set, and nothing in this
+		//    project ever sets it, so this translator is never asked for clip planes in practice.
+		// A real implementation would append "gl_ClipDistance[n] = dot( vTempPos, <plane n> );" here, before the Z/Y fixups below (the planes are
+		// D3D clip space planes), declare the extension at the top of the shader and feed the planes in as uniforms. That needs the engine-side
+		// header changes above and a device that exposes the extension to test on, so it is not attempted here.
+
 		if ( m_bDoFixupZ  || m_bDoFixupY )
 		{
-			// TODO: insert clip distance computation something like this:
-			//
-			// StrcatToALUCode( "DP4 oCLP[0].x, oPos, vc[215]; \n" );
-			//
-
 			if ( m_bDoFixupZ )
 			{
 				StrcatToALUCode( "vTempPos.z = vTempPos.z * vc[0].z - vTempPos.w; // z' = (2*z)-w\n" );
@@ -3808,12 +3872,9 @@ int D3DToGL::TranslateShader( uint32* code, CUtlBuffer *pBufDisassembledCode, bo
 		}
 		else
 		{
-			StrcatToParamCode( "OUTPUT oPos = result.position;\n" );
-
-			// TODO: insert clip distance computation something like this:
-			//
-			// StrcatToALUCode( "DP4 oCLP[0].x, oPos, c[215]; \n" );
-			//
+			// No fixups requested (CreateVertexShader() always asks for both, so this only serves other callers): the position goes out as written.
+			// (This used to emit "OUTPUT oPos = result.position;", which is ARB assembly, not GLSL.)
+			StrcatToALUCode( "gl_Position = vTempPos;\n" );
 		}
 	}
 		
