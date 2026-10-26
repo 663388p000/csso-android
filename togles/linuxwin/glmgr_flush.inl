@@ -29,14 +29,39 @@ FORCEINLINE GLuint GLMContext::FindSamplerObject( const GLMTexSamplingParams &de
 
 	if ( !m_samplerObjectHash[h].m_params.m_packed.m_isValid )
 	{
+		// A new combination of sampling parameters. Every slot owns one pre-generated GL sampler object, so the table has a fixed
+		// capacity, and it must always keep one empty slot or the probe loop above would never terminate on a miss. When the table
+		// is about to fill up it is recycled instead of being a fatal error: every entry is forgotten (the GL objects are kept, they
+		// are reconfigured when they are handed out again) and the entries are rebuilt on demand from the sampler state.
+		// This is a cold path - the table holds hundreds of combinations and a normal session needs a small fraction of them.
+		if ( m_nSamplerObjectHashNumEntries + 1 >= cSamplerObjectHashSize )
+		{
+			static bool s_bRecycleReported = false;
+			if ( !s_bRecycleReported )
+			{
+				s_bRecycleReported = true;
+				GLMDebugPrintf( "GLMContext: sampler object hash is full (%d entries), recycling it\n", (int)cSamplerObjectHashSize );
+			}
+
+			for ( int i = 0; i < cSamplerObjectHashSize; ++i )
+			{
+				memset( &m_samplerObjectHash[i].m_params, 0, sizeof( m_samplerObjectHash[i].m_params ) );
+			}
+			m_nSamplerObjectHashNumEntries = 0;
+
+			// A recycled object is reconfigured below while texture units may still have it bound, so every unit has to be bound
+			// again from the sampler state. The flush loop that called us keeps going until the dirty list is empty, which now
+			// means all of them, before anything is drawn.
+			MarkAllSamplersDirty();
+
+			// the table is empty, the first probe position is free
+			h = bitmix32( desiredParams.m_bits + desiredParams.m_borderColor ) & ( cSamplerObjectHashSize - 1 );
+		}
+
 		GLMTexSamplingParams &hashParams = m_samplerObjectHash[h].m_params;
 		hashParams = desiredParams;
 		hashParams.SetToSamplerObject( m_samplerObjectHash[h].m_samplerObject );
-		if ( ++m_nSamplerObjectHashNumEntries == cSamplerObjectHashSize )
-		{
-			// TODO: Support resizing
-			Error( "Sampler object hash is full, increase cSamplerObjectHashSize" );
-		}
+		++m_nSamplerObjectHashNumEntries;
 	}
 
 	return m_samplerObjectHash[h].m_samplerObject;
@@ -156,7 +181,9 @@ FORCEINLINE void GLMContext::FlushDrawStates( uint nStartIndex, uint nEndIndex, 
 			// Must have a depth texture and compare mode must be enabled
 			if ( !bSamplerIsDepth || !bSamplerShadow )
 			{
-				// FIXME: This occasionally occurs in L4D2 when CShaderAPIDx8::ExecuteCommandBuffer() sets the TEXTURE_WHITE texture in the flashlight depth texture slot.
+				// Known cause (seen in L4D2): CShaderAPIDx8::ExecuteCommandBuffer() binds the plain TEXTURE_WHITE texture in the flashlight depth
+				// texture slot, so the shader expects a shadow depth sampler but gets a colour texture. The draw still goes ahead with whatever is
+				// bound; this is a diagnostic only (GLMDEBUG builds) and the real fix lives in the engine's shaderapi, not in this layer.
 				GLMDebugPrintf( "Sampler %u's compare mode (%u) or format (depth=%u) is not consistent with pixel shader's compare mode (%u) (texture name: %s, pixel shader: %s)!\n",
 					nSamplerIndex, bSamplerShadow, bSamplerIsDepth, bShaderShadow,
 					m_samplers[nSamplerIndex].m_pBoundTex->m_debugLabel ? m_samplers[nSamplerIndex].m_pBoundTex->m_debugLabel : "?", 
@@ -473,7 +500,10 @@ FORCEINLINE void GLMContext::FlushDrawStates( uint nStartIndex, uint nEndIndex, 
 			GLint vconstInt0Loc = m_pBoundPair->m_locVertexInteger0;									//glGetUniformLocationARB( prog, "i0");
 			if ( vconstInt0Loc >= 0 )
 			{
-				gGL->glUniform1i( vconstInt0Loc, m_programParamsI[kGLMVertexProgram].m_values[0][0] );	//FIXME magic number
+				// "uniform int i0" in the translated shader holds one value: the iteration count of D3D's integer register i0, which is
+				// the x component (y and z, the loop start and step, are not used by the GLSL loops the translator emits).
+				const int nIntRegisterI0 = 0, nLoopCountComponent = 0;
+				gGL->glUniform1i( vconstInt0Loc, m_programParamsI[kGLMVertexProgram].m_values[nIntRegisterI0][nLoopCountComponent] );
 			}
 			m_programParamsI[kGLMVertexProgram].m_dirtySlotCount = 0;
 		}
