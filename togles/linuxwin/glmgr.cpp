@@ -240,13 +240,17 @@ void APIENTRY GL_Debug_Output_Callback(GLenum source, GLenum type, GLuint id, GL
 
 void GLMDebugPrintf( const char *pMsg, ... )
 {
-	//$ TODO: Should this call Warning()?
-	//$ TODO: Should replace call these calls with Warning() / Msg() / DevMsg()?
+	// Everything that goes through here is a warning or a diagnostic (GLSL translation errors, sampler / query misuse,
+	// leaks, ...), so it goes to the engine's Warning() spew instead of stdout: on Android stdout does not reach logcat, the
+	// spew does (tag SRCENG, see _SpewMessage() in tier0/dbg.cpp). Purely informational one-shot messages use Msg() at their call sites.
+	char szMsg[1024];
 
 	va_list args;
 	va_start( args, pMsg );
-	vprintf( pMsg, args );
+	V_vsnprintf( szMsg, sizeof( szMsg ), pMsg, args );
 	va_end( args );
+
+	Warning( "%s", szMsg );
 }
 
 //===============================================================================
@@ -775,8 +779,18 @@ void GLMContext::ProcessTextureDeletes()
 	CScopedGLMPIXEvent glmEvent( "GLMContext::ProcessTextureDeletes" );
 #endif
 
+	// A texture that is still attached to a framebuffer object can not be freed yet: the FBO detaches it later by
+	// dereferencing it (CGLMFBO::TexDetach), and scrubbing the attachment right here would rebind FBOs behind the back
+	// of the draw state (m_drawingFBO != m_boundDrawFBO) and leave the current FBO incomplete. So such a texture is
+	// deferred - put back on the queue and retried on the next call (once per Present) - instead of being leaked for good.
+	// Normally the attachment is already gone: releasing the D3D texture scrubs the FBO map (IDirect3DDevice9::ScrubFBOMap).
+	// Only look at the entries that were queued when we started, otherwise a deferred texture would be popped again right
+	// away and this would never return. Whatever is still pinned when the context dies is handled in ~GLMContext().
+	int nPending = m_DeleteTextureQueue.Count();
+	int nDeferred = 0;
+
 	CGLMTex* tex = nullptr;
-	while ( m_DeleteTextureQueue.PopItem( &tex ) )
+	while ( ( nPending-- > 0 ) && m_DeleteTextureQueue.PopItem( &tex ) )
 	{
 		for( int i = 0; i < GLM_SAMPLER_COUNT; i++)
 		{
@@ -785,28 +799,27 @@ void GLMContext::ProcessTextureDeletes()
 				BindTexToTMU( NULL, i );
 			}
 		}
-			
+
 		if ( tex->m_rtAttachCount != 0 )
 		{
-			// RG - huh? wtf? TODO: fix this code which seems to be purposely leaking
-			// leak it and complain - we may have to implement a deferred-delete system for tex like these
-
-			GLMDebugPrintf("GLMContext::DelTex: Leaking tex %08x [ %s ] - was attached for drawing at time of delete",tex, tex->m_layout->m_layoutSummary );
-
-			#if 0
-				// can't actually do this yet as the draw calls will tank
-				FOR_EACH_VEC( m_fboTable, i )
-				{
-					CGLMFBO *fbo = m_fboTable[i];
-					fbo->TexScrub( tex );
-				}
-				tex->m_rtAttachCount = 0;
-			#endif
+			m_DeleteTextureQueue.PushItem( tex );
+			nDeferred++;
 		}
 		else
-		{	
+		{
 			delete tex;
 		}
+	}
+
+	// Being deferred for a frame or two is fine. Being pinned for good is a leak worth a line in the log - say so once.
+	static int s_nPassesWithDeferred = 0;
+	if ( nDeferred == 0 )
+	{
+		s_nPassesWithDeferred = 0;
+	}
+	else if ( ++s_nPassesWithDeferred == 600 )
+	{
+		GLMDebugPrintf( "GLMContext::ProcessTextureDeletes: %d deleted texture(s) are still attached to a render target after %d passes, delete is deferred\n", nDeferred, s_nPassesWithDeferred );
 	}
 }
 
@@ -2112,7 +2125,10 @@ void GLMContext::BeginFrame( void )
 	m_lastKnownVertexAttribMask = 0;
 	m_nNumSetVertexAttributes = 0;
 	
-	//FIXME should we also zap the m_lastKnownAttribs array ? (worst case it just sets them all again on first batch)
+	// m_boundVertexAttribs (the last glVertexAttribPointer() arguments, used to absorb duplicate sets) is deliberately left alone:
+	// neither disabling the arrays above nor unbinding the buffers below changes that GL state, so the first batch of the frame
+	// can still skip every attribute pointer that did not change. Code that does change pointer state behind the tracker's
+	// back (PreloadTex(), the context init) resets it itself.
 
 	BindBufferToCtx( kGLMVertexBuffer, NULL, true );
 	BindBufferToCtx( kGLMIndexBuffer, NULL, true );
@@ -2406,7 +2422,7 @@ GLMContext::GLMContext( IDirect3DDevice9 *pDevice, GLMDisplayParams *params )
 	if ( CommandLine()->CheckParm( "-gl_texclientstorage" ) )
 		m_bTexClientStorage = true;
 
-	GLMDebugPrintf( "GL sampler object usage: %s\n", m_bUseSamplerObjects ? "ENABLED" : "DISABLED" );
+	Msg( "GL sampler object usage: %s\n", m_bUseSamplerObjects ? "ENABLED" : "DISABLED" );
 
 	m_nCurOwnerThreadId = ThreadGetCurrentId();
 	m_nThreadOwnershipReleaseCounter = 0;
@@ -2483,32 +2499,40 @@ GLMContext::GLMContext( IDirect3DDevice9 *pDevice, GLMDisplayParams *params )
 	IncrementWindowRefCount();
 
 	// If we're using GL_ARB_debug_output, go ahead and setup the callback here.
-	if ( CommandLine()->FindParm( "-gl_debug" ) ) 
+	if ( CommandLine()->FindParm( "-gl_debug" ) )
 	{
-//#if GLMDEBUG
-		// Turning this on is a perf loss, but it ensures that you can (at least) swap to the other 
-		// threads to see what call is currently being made.
-		// Note that if the driver is in multithreaded mode, you can put it back into singlethreaded mode
-		// and get a real stack for the offending gl call.
-		gGL->glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS_ARB);
+		// GLES: KHR_debug is core in GLES 3.2 and an extension below that, the desktop ARB_debug_output tokens have the same
+		// values. Both entry points are optional in our loader (a missing one is a NULL pointer), so check them before use:
+		// "-gl_debug" on a driver without debug output must not take the game down.
+		if ( gGL->glDebugMessageControl && gGL->glDebugMessageCallback )
+		{
+			// Turning this on is a perf loss, but it ensures that you can (at least) swap to the other
+			// threads to see what call is currently being made.
+			// Note that if the driver is in multithreaded mode, you can put it back into singlethreaded mode
+			// and get a real stack for the offending gl call.
+			gGL->glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS_ARB);
 
-#ifdef WIN32
-		// This happens early enough during init that DevMsg() does nothing.
-		OutputDebugStringA( "GLMContext::GLMContext: GL_DEBUG_OUTPUT_SYNCHRONOUS_ARB enabled!\n" );
-#else
-		printf( "GLMContext::GLMContext: GL_DEBUG_OUTPUT_SYNCHRONOUS_ARB enabled!\n" );
+			// KHR_debug (unlike ARB_debug_output) has a master switch which is off by default on a context that was not
+			// created as a debug context - without it the callback below would never be called on GLES.
+#ifndef GL_DEBUG_OUTPUT
+	#define GL_DEBUG_OUTPUT 0x92E0
 #endif
+			gGL->glEnable(GL_DEBUG_OUTPUT);
 
-		// TODO(nillerusr): rewrite me!!!
-		// This should be there if we get in here--make sure.
-		gGL->glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, (const GLuint *)NULL, GL_TRUE);
+			// This should be there if we get in here--make sure.
+			gGL->glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, (const GLuint *)NULL, GL_TRUE);
 
-		// Gonna filter these out, they're "chatty".
-		gGL->glDebugMessageControl(GL_DEBUG_SOURCE_API_ARB, GL_DEBUG_TYPE_OTHER_ARB, GL_DEBUG_SEVERITY_LOW_ARB, 0, (const GLuint *)NULL, GL_FALSE);
-		gGL->glDebugMessageCallback(GL_Debug_Output_Callback, (void*)NULL);
+			// Gonna filter these out, they're "chatty".
+			gGL->glDebugMessageControl(GL_DEBUG_SOURCE_API_ARB, GL_DEBUG_TYPE_OTHER_ARB, GL_DEBUG_SEVERITY_LOW_ARB, 0, (const GLuint *)NULL, GL_FALSE);
+			gGL->glDebugMessageCallback(GL_Debug_Output_Callback, (void*)NULL);
 
-		GLMDebugPrintf( "GLMContext::GLMContext: Debug output (gl_arb_debug_output) enabled!\n" );
-//#endif
+			// This happens early enough during init that DevMsg() does nothing, Msg() does not.
+			Msg( "GLMContext::GLMContext: Debug output (GL_DEBUG_OUTPUT_SYNCHRONOUS, KHR_debug / ARB_debug_output) enabled!\n" );
+		}
+		else
+		{
+			Warning( "GLMContext::GLMContext: -gl_debug ignored, the driver does not provide glDebugMessageControl / glDebugMessageCallback\n" );
+		}
 	}
 
 
@@ -2555,7 +2579,11 @@ GLMContext::GLMContext( IDirect3DDevice9 *pDevice, GLMDisplayParams *params )
 					
 	m_texLocks.EnsureCapacity( 16 );	// should be sufficient
 
-	// FIXME need a texture tracking table so we can reliably delete CGLMTex objects at context teardown
+	// The context does not keep a table of every texture. The D3D layer releases the textures it created before the device (and
+	// this context) goes away: their destructors queue them in m_DeleteTextureQueue, which ~GLMContext() drains. A texture the
+	// application leaks past that point is not freed here - its GL objects die with the GL context, only the small CPU side
+	// object stays behind - and freeing it from the context would turn that harmless leak into a use-after-free if the
+	// application still releases the texture afterwards.
 		
 	m_boundReadFBO = NULL;
 	m_boundDrawFBO = NULL;
@@ -2766,17 +2794,39 @@ GLMContext::~GLMContext	()
 
 	ProcessTextureDeletes();
 
+	// Whatever is still queued now was deferred because an FBO still has it attached. The FBOs are about to be destroyed,
+	// so this is the moment to detach those textures from every FBO and free them. It has to happen before the FBOs are
+	// destroyed: ~CGLMFBO() detaches through the texture, and ~CGLMTex() destroys the texture's own blit FBOs.
+	CGLMTex *pDeferredTex = NULL;
+	while ( m_DeleteTextureQueue.PopItem( &pDeferredTex ) )
+	{
+		FOR_EACH_VEC( m_fboTable, i )
+		{
+			m_fboTable[i]->TexScrub( pDeferredTex );
+		}
+
+		if ( pDeferredTex->m_rtAttachCount == 0 )
+		{
+			delete pDeferredTex;
+		}
+		else
+		{
+			// Not expected (every FBO is in m_fboTable). Freeing it would leave a dangling pointer in the FBO that still has it.
+			GLMDebugPrintf( "GLMContext::~GLMContext: Leaking tex %p [ %s ] - still attached to an FBO\n", pDeferredTex, pDeferredTex->m_layout->m_layoutSummary );
+		}
+	}
+
 	if ( m_pNullFragmentProgram )
 	{
 		DelProgram( m_pNullFragmentProgram );
 		m_pNullFragmentProgram = NULL;
 	}
-	
-	// walk m_fboTable and free them up..
-	FOR_EACH_VEC( m_fboTable, i )
+
+	// walk m_fboTable and free them up.. (DelFBO() removes the entry it is given from the table, so always take the last one
+	// - walking the table by index while it shrinks would skip every other FBO and leak it)
+	while ( m_fboTable.Count() > 0 )
 	{
-		CGLMFBO *fbo = m_fboTable[i];
-		DelFBO( fbo );
+		DelFBO( m_fboTable.Tail() );
 	}
 	m_fboTable.SetSize( 0 );
 
@@ -3480,31 +3530,27 @@ void GLMContext::DebugDump( GLMDebugHookInfo *info, uint options, uint vertDumpM
 	{
 		GLMPRINTF(( "-D-" ));
 		GLMPRINTF(( "-D- Texture / Sampler setup" ));
-		GLMPRINTF(( "-D- TODO" ));
-#if 0
+
+		// the packed sampler fields hold the D3D values, D3DTADDRESS_WRAP/CLAMP/BORDER = 0/1/2 and D3DTEXF_NONE/POINT/LINEAR/ANISOTROPIC = 0..3
+		static const char *s_addressNames[4] = { "WRAP", "CLAMP", "BORDER", "?" };
+		static const char *s_filterNames[4]  = { "NONE", "POINT", "LINEAR", "ANISOTROPIC" };
+
 		for( int i=0; i<GLM_SAMPLER_COUNT; i++ )
 		{
 			if (m_samplers[i].m_pBoundTex)
 			{
-				GLMTexSamplingParams *samp = &m_samplers[i].m_samp;
+				const GLMTexPackedSamplingParams &samp = m_samplers[i].m_samp.m_packed;
 				GLMPRINTF(( "-D-" ));
-				GLMPRINTF(("-D- Sampler %-2d tex %08x  layout %s", i, m_samplers[i].m_pBoundTex, m_samplers[i].m_pBoundTex->m_layout->m_layoutSummary ));
+				GLMPRINTF(("-D- Sampler %-2d tex %p  layout %s", i, m_samplers[i].m_pBoundTex, m_samplers[i].m_pBoundTex->m_layout->m_layoutSummary ));
 
-				GLMPRINTF(("-D-           addressMode[ %s %s %s ]",
-					GLMDecode( eGL_ENUM, samp->m_addressModes[0] ),
-					GLMDecode( eGL_ENUM, samp->m_addressModes[1] ),
-					GLMDecode( eGL_ENUM, samp->m_addressModes[2] )
-				));
-					
-				GLMPRINTF(("-D-           magFilter    [ %s ]", GLMDecode( eGL_ENUM, samp->m_magFilter ) ));
-				GLMPRINTF(("-D-           minFilter    [ %s ]", GLMDecode( eGL_ENUM, samp->m_minFilter ) ));
-				GLMPRINTF(("-D-           srgb         [ %s ]", samp->m_srgb ? "T" : "F" ));
-				GLMPRINTF(("-D-           shadowFilter [ %s ]", samp->m_compareMode == GL_COMPARE_R_TO_TEXTURE_ARB ? "T" : "F" ));
-				
-				// add more as needed later..
+				GLMPRINTF(("-D-           addressMode[ %s %s %s ]", s_addressNames[ samp.m_addressU ], s_addressNames[ samp.m_addressV ], s_addressNames[ samp.m_addressW ] ));
+				GLMPRINTF(("-D-           magFilter    [ %s ]", s_filterNames[ samp.m_magFilter ] ));
+				GLMPRINTF(("-D-           minFilter    [ %s ]  mipFilter [ %s ]", s_filterNames[ samp.m_minFilter ], s_filterNames[ samp.m_mipFilter ] ));
+				GLMPRINTF(("-D-           maxAniso     [ %d ]  minLOD [ %d ]  lodBias [ %f ]", (int)samp.m_maxAniso, (int)samp.m_minLOD, m_samplers[i].m_samp.m_lodBias ));
+				GLMPRINTF(("-D-           srgb         [ %s ]", samp.m_srgb ? "T" : "F" ));
+				GLMPRINTF(("-D-           shadowFilter [ %s ]", samp.m_compareMode ? "T" : "F" ));
 			}
-		}		
-#endif
+		}
 	}
 
 	if ( (options & (1<<eDumpVertexAttribSetup)) && is_draw )
@@ -3845,7 +3891,9 @@ int g_knobcount = sizeof( g_knobnames ) / sizeof( g_knobnames[0] );
 
 void GLMContext::DebugHook( GLMDebugHookInfo *info )
 {
-	// FIXME: This has seriously bitrotted.
+	// The interactive batch debugger (pause / step / re-run a batch from the keyboard, driven by the debug event queue) is switched
+	// off on purpose: it was written for the OSX launcher, has bitrotted since, and has no counterpart on this platform.
+	// So the hook returns right away, and everything below is only kept for reference.
 	return;
 
 	bool debughook = false;
@@ -3991,7 +4039,7 @@ void GLMContext::DebugHook( GLMDebugHookInfo *info )
 					}
 				}
 				
-				// TODO - need to retest this whole path
+				// (reference code, only reachable through the debug hook that is switched off at the top of this function)
 				FlushDrawStates( 0, 0, 0 );	// this is key, because the linked shader pair may have changed (note call to PurgePairsWithShader in cglmprogram.cpp)
 				
 				GLMPRINTF(("-- Shader changed, re-running batch" ));
@@ -4767,7 +4815,9 @@ void GLMgrSelfTests( void )
 	glmParams.m_focusWindow					=	0;
 
 	// make a new context on renderer 0.
-	GLMContext *ctx = GLMgr::aGLMgr()->NewContext( NULL, &glmParams );	////FIXME you can't make contexts this way any more.
+	// (disabled by the early return at the top: a context can no longer be created standalone like this - it needs a device -
+	// so these self tests would have to be reworked before they can run again)
+	GLMContext *ctx = GLMgr::aGLMgr()->NewContext( NULL, &glmParams );
 	if (!ctx)
 	{
 		DebuggerBreak();		// no go
@@ -4981,7 +5031,8 @@ void GLMContext::DrawRangeElementsNonInline( GLenum mode, GLuint start, GLuint e
 		IDirect3DVertexDeclaration9	*pVertDecl = m_pDevice->m_pVertDecl;
 		const uint8	*pVertexAttribDescToStreamIndex = pVertDecl->m_VertexAttribDescToStreamIndex;
 
-		// FIXME: Having to duplicate all this flush logic is terrible here
+		// This walks the vertex attributes the same way FlushDrawStates() does. The duplication is deliberate: this is a debug-only
+		// verifier (GL_ENABLE_INDEX_VERIFICATION) and must not add anything to the hot flush path by sharing code with it.
 		for( int nMask = 1, nIndex = 0; nIndex < nMaxVertexAttributesToCheck; ++nIndex, nMask <<= 1 )
 		{
 			uint8 vertexShaderAttrib = pVertexShaderAttribMap[ nIndex ];
@@ -5089,9 +5140,10 @@ void GLMContext::DrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsize
 
 		// always sync with editable shader text prior to draw
 #if GLMDEBUG
-		// TODO - fixup OSX 10.6 m_boundProg not used in this version togl (m_pBoundPair)
-		//FIXME disengage this path if context is in GLSL mode..
-		// it will need fixes to get the shader pair re-linked etc if edits happen anyway.
+		// (This whole OSX 10.6 variant is dead code: the '#if 1' above always selects the glDrawRangeElementsBaseVertex version. It
+		// still refers to m_boundProgram, which glmgr.h declares for OSX GLMDEBUG builds only - the GLSL path tracks the bound
+		// program pair in m_pBoundPair - and it would need the shader pair re-linked after an edit, so it would have to be reworked
+		// before it could be turned on.)
 
 		if (m_boundProgram[kGLMVertexProgram])
 		{
