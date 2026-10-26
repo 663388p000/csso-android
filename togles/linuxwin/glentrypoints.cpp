@@ -395,10 +395,10 @@ COpenGLEntryPoints::COpenGLEntryPoints()
 
 	Msg("GL_EXTENSIONS=\"%s\"\n", m_pGLDriverStrings[cGLExtensionsString]);
 
-	// !!! FIXME: Alfred says the original GL_APPLE_fence code only exists to
-	// !!! FIXME:  hint Apple's drivers and not because we rely on the
-	// !!! FIXME:  functionality. If so, just remove this check (and the
-	// !!! FIXME:  GL_NV_fence code entirely).
+	// Fences: the check this note used to sit on (GL_APPLE_fence, which only ever hinted Apple's drivers) is gone, and this
+	//  port always uses GL sync objects - GL_ARB_sync is forced on below (it is core in GLES 3.0), and CGLMQuery tries it
+	//  first, so the GL_NV_fence / GL_APPLE_fence fallbacks left in cglmquery.cpp are never taken here. They are shared code
+	//  and use entry points declared in the engine's glfuncs.h (not part of this tree), so they are left alone.
 
 	// GL_ARB_framebuffer_object is a superset of GL_EXT_framebuffer_object,
 	//  (etc) but if you don't call in through the ARB entry points, you won't
