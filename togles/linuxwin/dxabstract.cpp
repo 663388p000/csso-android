@@ -1360,7 +1360,9 @@ HRESULT IDirect3D9::CheckDeviceFormat(UINT Adapter,D3DDEVTYPE DeviceType,D3DFORM
 													legalUsage |=	D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING;
 						break;
 
-//$ TODO: Need to merge bitmap changes over from Dota to get these formats.
+// A2R10G10B10 / A2B10G10R10 are left out on purpose, keep them in step with the format table in cglmtex.cpp: nothing in this
+// engine branch creates such textures (the bitmap / image format support for them only exists in the Dota 2 engine), and the
+// table entries use a desktop-only GL token, so they can not simply be switched on here.
 #if 0
 						case D3DFMT_A2R10G10B10:	legalUsage	=	D3DUSAGE_DYNAMIC | D3DUSAGE_AUTOGENMIPMAP | D3DUSAGE_QUERY_FILTER;
 													legalUsage |=	D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING;
@@ -1579,9 +1581,11 @@ HRESULT IDirect3D9::EnumAdapterModes(UINT Adapter,D3DFORMAT Format,UINT Mode,D3D
 HRESULT IDirect3D9::CheckDeviceType(UINT Adapter,D3DDEVTYPE DevType,D3DFORMAT AdapterFormat,D3DFORMAT BackBufferFormat,BOOL bWindowed)
 {
 	GL_BATCH_PERF_CALL_TIMER;
-	//FIXME: we just say "OK" on any query
+	// Deliberately permissive: every combination is reported as supported. The back buffer is an ordinary render target
+	// texture (see IDirect3DDevice9::Create), so whether its format works is decided by the texture format table when that
+	// texture is created, not by a separate adapter/back buffer format matrix - there is nothing useful to refuse here.
 
-	GLMPRINTF(( "-X- IDirect3D9::CheckDeviceType:    Adapter=%d || DevType=%d:%s || AdapterFormat=%d:%s || BackBufferFormat=%d:%s || bWindowed=%d",
+	GLMPRINTF(( "-X- IDirect3D9::CheckDeviceType:   Adapter=%d || DevType=%d:%s || AdapterFormat=%d:%s || BackBufferFormat=%d:%s || bWindowed=%d",
 		Adapter,
 		DevType, GLMDecode(eD3D_DEVTYPE,DevType),
 		AdapterFormat, GLMDecode(eD3D_FORMAT, AdapterFormat),
@@ -1620,7 +1624,7 @@ HRESULT IDirect3D9::GetAdapterDisplayMode(UINT Adapter,D3DDISPLAYMODE* pMode)
 	pMode->Width		= glmModeInfo.m_modePixelWidth;
 	pMode->Height		= glmModeInfo.m_modePixelHeight;
 	pMode->RefreshRate	= glmModeInfo.m_modeRefreshHz;		// "adapter default"
-	pMode->Format		= D3DFMT_X8R8G8B8;					//FIXME, this is a SWAG
+	pMode->Format		= D3DFMT_X8R8G8B8;					// the display DB has no bit depth for a mode (see GLMDisplayModeInfoFields), the window surface is 8 bit RGB
 
 	return S_OK;
 }
@@ -1735,8 +1739,7 @@ HRESULT IDirect3D9::CreateDevice(UINT Adapter,D3DDEVTYPE DeviceType,VD3DHWND hFo
 	GL_BATCH_PERF_CALL_TIMER;
 
 #if GLMDEBUG
-	GLMDebugPrintf( "WARNING: GLMEBUG is 1, perf. is going to be low!" );
-	Warning( "WARNING: GLMEBUG is 1, perf. is going to be low!" );
+	Warning( "WARNING: GLMEBUG is 1, perf. is going to be low!\n" );
 #endif
 #if !TOGL_SUPPORT_NULL_DEVICE	
 	if (DeviceType == D3DDEVTYPE_NULLREF)
@@ -2033,20 +2036,23 @@ HRESULT IDirect3DDevice9::CreateVertexBuffer(UINT Length,DWORD Usage,DWORD FVF,D
 	
 	newbuff->m_ctx = m_ctx;
 
-		// FIXME need to find home or use for the Usage, FVF, Pool values passed in
+	// Every creation parameter is kept in m_vtxDesc (that is what GetDesc reports), but only D3DUSAGE_DYNAMIC changes what
+	// gets created: GL has no memory pools, and Source feeds its vertex buffers through vertex declarations, so the FVF
+	// is never used to interpret the data.
 	uint options = 0;
-	
+
 	if (Usage&D3DUSAGE_DYNAMIC)
 	{
 		options |= GLMBufferOptionDynamic;
 	}
-	
+
 	newbuff->m_vtxBuffer = m_ctx->NewBuffer( kGLMVertexBuffer, Length, options  ) ;
-	
+
 	newbuff->m_vtxDesc.Type		= D3DRTYPE_VERTEXBUFFER;
 	newbuff->m_vtxDesc.Usage	= Usage;
 	newbuff->m_vtxDesc.Pool		= Pool;
 	newbuff->m_vtxDesc.Size		= Length;
+	newbuff->m_vtxDesc.FVF		= FVF;
 
 	*ppVertexBuffer = newbuff;
 	
@@ -2084,18 +2090,24 @@ HRESULT IDirect3DVertexBuffer9::Lock(UINT OffsetToLock,UINT SizeToLock,void** pp
 	GL_PUBLIC_ENTRYPOINT_CHECKS( m_device );
 	tmZoneFiltered( TELEMETRY_LEVEL2, 25, TMZF_NONE, "VB Lock" );
 
-	// FIXME would be good to have "can't lock twice" logic
-
 	Assert( !(Flags & D3DLOCK_READONLY) );	// not impl'd
 //	Assert( !(Flags & D3DLOCK_NOSYSLOCK) );	// not impl'd - it triggers though
-	
+
 	GLMBuffLockParams lockreq;
 	lockreq.m_nOffset		= OffsetToLock;
 	lockreq.m_nSize			= SizeToLock;
 	lockreq.m_bNoOverwrite	= (Flags & D3DLOCK_NOOVERWRITE) != 0;
 	lockreq.m_bDiscard		= (Flags & D3DLOCK_DISCARD) != 0;
-			
+
+	// "Can't lock twice": CGLMBuffer::Lock() refuses a lock while the buffer is already locked (and a range that is not inside
+	// the buffer) and returns without writing an address. Report that the way D3D does, D3DERR_INVALIDCALL, instead of S_OK
+	// with an unset pointer - callers have a fallback for a failed lock, but none for a wild pointer.
+	*ppbData = NULL;
 	m_vtxBuffer->Lock( &lockreq, (char**)ppbData );
+	if ( !*ppbData )
+	{
+		return D3DERR_INVALIDCALL;
+	}
 
 	GLMPRINTF(("-X- IDirect3DDevice9::Lock on D3D buf %p (GL name %d) offset %d, size %d => address %p", this, this->m_vtxBuffer->m_nHandle, OffsetToLock, SizeToLock, *ppbData));
 	return S_OK;
@@ -2148,9 +2160,11 @@ HRESULT IDirect3DDevice9::CreateIndexBuffer(UINT Length,DWORD Usage,D3DFORMAT Fo
 		
 	newbuff->m_ctx = m_ctx;
 	
-		// FIXME need to find home or use for the Usage, Format, Pool values passed in
+	// Every creation parameter is kept in m_idxDesc (that is what GetDesc reports), but only D3DUSAGE_DYNAMIC changes what
+	// gets created: GL has no memory pools, and the draw calls always read 16 bit indices (GL_UNSIGNED_SHORT), which is all
+	// Source uses.
 	uint options = 0;
-	
+
 	if (Usage&D3DUSAGE_DYNAMIC)
 	{
 		options |= GLMBufferOptionDynamic;
@@ -2201,17 +2215,22 @@ HRESULT IDirect3DIndexBuffer9::Lock(UINT OffsetToLock,UINT SizeToLock,void** ppb
 {
 	GL_BATCH_PERF_CALL_TIMER;
 	GL_PUBLIC_ENTRYPOINT_CHECKS( m_device );
-	// FIXME would be good to have "can't lock twice" logic
 
 	tmZoneFiltered( TELEMETRY_LEVEL2, 25, TMZF_NONE, "IB Lock" );
-	
+
 	GLMBuffLockParams lockreq;
 	lockreq.m_nOffset		= OffsetToLock;
 	lockreq.m_nSize			= SizeToLock;
 	lockreq.m_bNoOverwrite	= ( Flags & D3DLOCK_NOOVERWRITE ) != 0;
 	lockreq.m_bDiscard		= ( Flags & D3DLOCK_DISCARD ) != 0;
-	
+
+	// "Can't lock twice": same handling as IDirect3DVertexBuffer9::Lock() - a refused lock is reported as D3DERR_INVALIDCALL.
+	*ppbData = NULL;
 	m_idxBuffer->Lock( &lockreq, (char**)ppbData );
+	if ( !*ppbData )
+	{
+		return D3DERR_INVALIDCALL;
+	}
 
 	return S_OK;
 }
@@ -2301,7 +2320,7 @@ HRESULT	IDirect3DDevice9::Create( IDirect3DDevice9Params *params )
 {
 	g_pD3D_Device = this;
 
-	GLMDebugPrintf( "IDirect3DDevice9::Create: BackBufWidth: %u, BackBufHeight: %u, D3DFMT: %u, BackBufCount: %u, MultisampleType: %u, MultisampleQuality: %u\n",
+	Msg( "IDirect3DDevice9::Create: BackBufWidth: %u, BackBufHeight: %u, D3DFMT: %u, BackBufCount: %u, MultisampleType: %u, MultisampleQuality: %u\n",
 		params->m_presentationParameters.BackBufferWidth,
 		params->m_presentationParameters.BackBufferHeight,
 		params->m_presentationParameters.BackBufferFormat,
@@ -2357,7 +2376,9 @@ HRESULT	IDirect3DDevice9::Create( IDirect3DDevice9Params *params )
 
 	glmParams.m_focusWindow					=	params->m_focusWindow;	
 
-		#if 0	//FIXME-HACK
+		// Disabled on purpose: this platform has exactly one renderer and one display (GLMDisplayDB keeps a single renderer), so every
+		// D3D adapter maps to index 0 and the zeroed GLMDisplayParams already select it. The multi-GPU mapping is kept for reference.
+		#if 0
 			// map the D3D "adapter" to a renderer/display pair
 			// (that GPU will have to stay set as-is for any subsequent mode changes)
 		
@@ -2593,7 +2614,7 @@ HRESULT IDirect3DDevice9::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters)
 	// so some of this looks a lot like Create - we're just a subset of what it does.
 	// with a little work you could refactor this to be common code.
 
-	GLMDebugPrintf( "IDirect3DDevice9::Reset: BackBufWidth: %u, BackBufHeight: %u, D3DFMT: %u, BackBufCount: %u, MultisampleType: %u, MultisampleQuality: %u\n",
+	Msg( "IDirect3DDevice9::Reset: BackBufWidth: %u, BackBufHeight: %u, D3DFMT: %u, BackBufCount: %u, MultisampleType: %u, MultisampleQuality: %u\n",
 		pPresentationParameters->BackBufferWidth,
 		pPresentationParameters->BackBufferHeight,
 		pPresentationParameters->BackBufferFormat,
@@ -3144,18 +3165,19 @@ HRESULT IDirect3DDevice9::CreateRenderTarget(UINT Width,UINT Height,D3DFORMAT Fo
 	{
 		rtkey.m_texFlags |= kGLMTexMultisampled;
 		rtkey.m_texSamples = MultiSample;
-		// FIXME no support for "MS quality" yet
+		// D3D "multisample quality" has no GL counterpart: CheckDeviceMultiSampleType() reports a single quality level (level 0)
+		// for every supported sample count, so the quality value is only recorded in the desc below.
 	}
 
 	surf->m_tex			= m_ctx->NewTex( &rtkey, 1, pDebugLabel );
 	surf->m_face		= 0;
 	surf->m_mip			= 0;
-	
-	//desc
+
+	//desc - what D3D9 reports for a surface made by CreateRenderTarget
 	surf->m_desc.Format				=	Format;
     surf->m_desc.Type				=	D3DRTYPE_SURFACE;
-    surf->m_desc.Usage				=	0;					//FIXME ???????????
-    surf->m_desc.Pool				=	D3DPOOL_DEFAULT;	//FIXME ???????????
+    surf->m_desc.Usage				=	D3DUSAGE_RENDERTARGET;
+    surf->m_desc.Pool				=	D3DPOOL_DEFAULT;
 	surf->m_desc.MultiSampleType	=	MultiSample;
     surf->m_desc.MultiSampleQuality	=	MultisampleQuality;
     surf->m_desc.Width				=	Width;
@@ -3364,26 +3386,9 @@ HRESULT IDirect3DDevice9::SetRenderTarget(DWORD RenderTargetIndex,IDirect3DSurfa
 	
 	m_bFBODirty = true;
 
-/*
-	if (!pRenderTarget)
-	{		
-		GLMPRINTF(("-F-             --> Setting NULL render target on index=%d ",RenderTargetIndex));
-	}
-	else
-	{
-		GLMPRINTF(("-F-             --> attaching index=%d on drawing FBO (%8x)",RenderTargetIndex, m_drawableFBO));
-		// attach color to FBO
-		GLMFBOTexAttachParams	rtParams;
-		memset( &rtParams, 0, sizeof(rtParams) );
-		
-		rtParams.m_tex		= pRenderTarget->m_tex;
-		rtParams.m_face		= pRenderTarget->m_face;
-		rtParams.m_mip		= pRenderTarget->m_mip;
-		rtParams.m_zslice	= 0;	// FIXME if you ever want to be able to render to slices of a 3D tex..
-		
-		m_drawableFBO->TexAttach( &rtParams, (EGLMFBOAttachment)(kAttColor0 + RenderTargetIndex) );
-	}
-*/
+	// Nothing is attached to a GL framebuffer here. m_bFBODirty makes UpdateBoundFBO() look up (or build) the FBO for the
+	// current set of render targets before the next draw. Only 2D textures and cube faces can be attached: rendering into a
+	// slice of a 3D texture (GLMFBOTexAttachParams::m_zslice) is not supported, and nothing in Source asks for it.
 
 #if GL_BATCH_PERF_ANALYSIS && GL_BATCH_PERF_ANALYSIS_WRITE_PNGS
 	if ( m_pBatch_vis_bitmap && m_pBatch_vis_bitmap->is_valid() && !RenderTargetIndex )
@@ -3498,19 +3503,19 @@ HRESULT IDirect3DDevice9::CreateDepthStencilSurface(UINT Width,UINT Height,D3DFO
 	{
 		depthkey.m_texFlags |= kGLMTexMultisampled;
 		depthkey.m_texSamples = MultiSample;
-		// FIXME no support for "MS quality" yet
+		// D3D "multisample quality" has no GL counterpart (see CreateRenderTarget): only recorded in the desc below.
 	}
 
 	surf->m_tex				= m_ctx->NewTex( &depthkey, 1, "depth-stencil surface" );
 	surf->m_face			= 0;
 	surf->m_mip				= 0;
 
-	//desc
+	//desc - what D3D9 reports for a surface made by CreateDepthStencilSurface
 
 	surf->m_desc.Format				=	Format;
     surf->m_desc.Type				=	D3DRTYPE_SURFACE;
-    surf->m_desc.Usage				=	0;					//FIXME ???????????
-    surf->m_desc.Pool				=	D3DPOOL_DEFAULT;	//FIXME ???????????
+    surf->m_desc.Usage				=	D3DUSAGE_DEPTHSTENCIL;
+    surf->m_desc.Pool				=	D3DPOOL_DEFAULT;
 	surf->m_desc.MultiSampleType	=	MultiSample;
     surf->m_desc.MultiSampleQuality	=	MultisampleQuality;
     surf->m_desc.Width				=	Width;
@@ -5295,7 +5300,11 @@ HRESULT IDirect3DDevice9::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType,UINT Star
 	return S_OK;
 }
 
-// 7LS - TODO
+// User-pointer draws are not provided by this layer, and the block below is not even compiled (DX_TO_GL_ABSTRACTION is always
+// defined here). Source only issues them from X360-only code (CShaderAPIDx8::RestorePersistedDisplay,
+// CShaderDeviceDx8::RefreshFrontBufferNonInteractive) and from ForceHardwareSync_WithManagedTexture(), which
+// CShaderAPIDx8::ForceHardwareSync() never reaches under DX_TO_GL_ABSTRACTION (it returns first) - nothing on the GL path
+// calls them. The same goes for DrawIndexedPrimitiveUP further down.
 #ifndef DX_TO_GL_ABSTRACTION
 HRESULT IDirect3DDevice9::DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType,UINT PrimitiveCountx,CONST void* pVertexStreamZeroData,UINT VertexStreamZeroStride)
 {
@@ -5685,7 +5694,8 @@ HRESULT IDirect3DDevice9::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType,
 
 BOOL IDirect3DDevice9::ShowCursor(BOOL bShow)
 {
-	// FIXME NOP
+	// Intentionally a no-op: the mouse cursor belongs to the window system, not to the GL device. It is owned by the
+	// launcher (ILauncherMgr::SetMouseVisible / SetMouseCursor).
 	//DXABSTRACT_BREAK_ON_ERROR();
 	return TRUE;
 }
@@ -6288,7 +6298,7 @@ HRESULT IDirect3DDevice9::SetRenderState( D3DRENDERSTATETYPE State, DWORD Value 
 		case D3DRS_BLENDOPALPHA:
 		case D3DRS_SRCBLENDALPHA:
 		case D3DRS_DESTBLENDALPHA:
-		case D3DRS_TWOSIDEDSTENCILMODE:	// -> GL_STENCIL_TEST_TWO_SIDE_EXT... not yet implemented ?
+		case D3DRS_TWOSIDEDSTENCILMODE:	// deliberately ignored: CShaderAPIDx8 only ever forces it to FALSE (and the CCW_STENCIL* states to KEEP/ALWAYS) at device init, never enables it
 		case D3DRS_CCW_STENCILFAIL:		// GLStencilOp_t
 		case D3DRS_CCW_STENCILZFAIL:		// GLStencilOp_t
 		case D3DRS_CCW_STENCILPASS:		// GLStencilOp_t
@@ -6707,6 +6717,11 @@ D3DXMATRIX* D3DXMatrixTranspose( D3DXMATRIX *pOut, CONST D3DXMATRIX *pM )
 }
 
 
+// A plane whose normal is shorter than this counts as degenerate. It is far below the length of any real plane normal (Source
+// only hands in unit-length ones), and far above the point where the float sum of squares below stops being accurate (a normal
+// shorter than about 1e-19 underflows), so the division stays well conditioned.
+static const float kPlaneNormalizeEpsilon = 1e-10f;
+
 D3DXPLANE* D3DXPlaneNormalize( D3DXPLANE *pOut, CONST D3DXPLANE *pP)
 {
 	// not very different from normalizing a vector.
@@ -6714,9 +6729,9 @@ D3DXPLANE* D3DXPlaneNormalize( D3DXPLANE *pOut, CONST D3DXPLANE *pP)
 	// make sure that's non zero
 	// then divide all four components by that value
 	// or return some dummy plane like 0,0,1,0 if it fails
-	
+
 	float	len = sqrt( (pP->a * pP->a) + (pP->b * pP->b) + (pP->c * pP->c) );
-	if (len > 1e-10)	//FIXME need a real epsilon here ?
+	if (len > kPlaneNormalizeEpsilon)
 	{
 		pOut->a = pP->a / len;		pOut->b = pP->b / len;		pOut->c = pP->c / len;		pOut->d = pP->d / len;
 	}
