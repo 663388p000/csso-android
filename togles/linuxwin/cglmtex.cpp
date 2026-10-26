@@ -35,6 +35,7 @@ extern "C" {
 #include "tier0/icommandline.h"
 #include "glmtexinlines.h"
 #include "astc_texcompress.h"
+#include "arm_neon_opt.h"		// NEON texel padding / conversion (AArch64 only; scalar fallback otherwise)
 #include "tier0/dbg.h"		// Warning() / Msg() / Error() for the ASTC upload diagnostics		// added: ASTC LDR/HDR runtime recompression for ARGB/RGBA formats
 
 // memdbgon -must- be the last include file in a .cpp file.
@@ -378,7 +379,10 @@ const GLMTexFormatDesc g_formatDescTable[] =
 	{ "_V8U8",			D3DFMT_V8U8,			GL_RGB8,							0,									GL_RG,					GL_BYTE,						1, 2 },
 	
 	{ "_R32F",			D3DFMT_R32F,			GL_R32F,							GL_R32F,							GL_RED,					GL_FLOAT,						1, 4 },
-//$ TODO: Need to merge bitmap changes over from Dota to get these formats.
+	// A2R10G10B10 / A2B10G10R10 are left out on purpose: nothing in this engine branch creates such textures (the bitmap / image
+	// format support for them only exists in the Dota 2 engine), and GL_UNSIGNED_INT_10_10_10_2 below is a desktop-only token
+	// (GLES has GL_UNSIGNED_INT_2_10_10_10_REV), so these entries can not simply be switched on. DXABSTRACT's CheckDeviceFormat()
+	// has the matching (also disabled) cases.
 #if 0
 	{ "_A2R10G10B10",	D3DFMT_A2R10G10B10,		GL_RGB10_A2,						GL_RGB10_A2,						GL_RGBA,				GL_UNSIGNED_INT_10_10_10_2,		1, 4 },
 	{ "_A2B10G10R10",	D3DFMT_A2B10G10R10,		GL_RGB10_A2,						GL_RGB10_A2,						GL_BGRA,				GL_UNSIGNED_INT_10_10_10_2,		1, 4 },
@@ -793,9 +797,11 @@ GLMTexLayout *CGLMTexLayoutTable::NewLayoutRef( GLMTexLayoutKey *pDesiredKey )
 			
 			// assume renderable and srgb
 			Assert( (key->m_texFlags & kGLMTexRenderable) !=0 );
-			//Assert( (key->m_texFlags & kGLMTexSRGB) !=0 );			//FIXME don't assert on making depthstencil surfaces which are non srgb
-			
-			// double check sample count (FIXME need real limit check here against device/driver)
+			// (kGLMTexSRGB is deliberately not asserted: depth/stencil surfaces are multisampled too, and those are never sRGB)
+
+			// Sanity check of the requested sample count only. The device/driver limit is applied where the render buffer is
+			// actually allocated: CGLMTex::CGLMTex() clamps the request to the renderer's m_maxSamples before calling
+			// glRenderbufferStorageMultisample(), and the D3D side never asks for more than CheckDeviceMultiSampleType() allows.
 			Assert( (key->m_texSamples==2) || (key->m_texSamples==4) || (key->m_texSamples==6) || (key->m_texSamples==8) );
 		}
 		
@@ -3790,7 +3796,10 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 			Error( "CompressedTexImage2D: out of memory padding a %dx%d texture\n", (int)width, (int)height );
 			return;
 		}
-		for ( size_t i = 0; i < nPixels; ++i )
+		// AArch64: NEON pads 16 pixels per iteration (ld3 + st4); the scalar loop below does whatever is left
+		// (and everything on CPUs without the NEON path).
+		const size_t nVec = ArmOpt_U8ToRGBA( rgb, nPixels, ARMOPT_LAY_RGB, /*forceOpaque=*/1, paddedRGBA );
+		for ( size_t i = nVec; i < nPixels; ++i )
 		{
 			paddedRGBA[i*4+0] = rgb[i*3+0];
 			paddedRGBA[i*4+1] = rgb[i*3+1];
