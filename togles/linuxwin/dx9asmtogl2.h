@@ -44,7 +44,7 @@
 #define D3DToGL_OptionDoFixupZ					0x0002		// Add instructions to put Z in the right interval for GL
 #define D3DToGL_OptionDoFixupY					0x0004		// Add instructions to flip the Y over for GL
 #define D3DToGL_OptionDoUserClipPlanes			0x0008		// ARB mode: Include OPTION vertex_program_2 and append DP4's to write into oCLP[0] and oCLP[1]
-															// GLSL mode: generate code to write gl_ClipVertex
+															// GLSL mode: accepted, but no clip output is generated (GLES has no gl_ClipVertex) - see the user clip plane note in TranslateShader()
 
 #define D3DToGL_AddHexComments					0x0020		// Include hex comments in the code for debugging
 #define D3DToGL_PutHexCommentsAfterLines		0x0040		// If D3DToGL_AddHexComments is set, this puts the codes to the right, rather than on separate lines
@@ -256,6 +256,7 @@ private:
 	void HandleBinaryOp_ASM( uint32 nInstruction );
 	void Handle_CMP();
 	void Handle_NRM();
+	void Handle_SGN( uint32 dwToken );
 	void Handle_DeclarativeNonDclOp( uint32 nInstruction );
 
 public:
