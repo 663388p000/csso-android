@@ -1274,10 +1274,18 @@ CGLMShaderPair	*CGLMShaderPairCache::SelectShaderPairInternal( CGLMProgram *vp, 
 		CGLMPairCacheEntry *evict = row + oldestway;
 			
 		Assert( evict->m_pair != NULL );
-		Assert( evict->m_pair != m_ctx->m_pBoundPair );	// just check
-			
-		///////////////////////FIXME may need to do a shoot-down if the pair being evicted is currently active in the context
-			
+
+		// Shoot-down: if the victim happens to be the pair that is currently bound in the context, forget the binding
+		// before the pair is freed (same convention as PurgePairsWithShader()). Leaving m_pBoundPair dangling is worse
+		// than it looks: the replacement pair allocated below usually lands on the very same address, so FlushDrawStates()
+		// would see "pNewPair == m_pBoundPair", skip glUseProgram() and keep drawing with the already deleted GL program
+		// while uploading the uniforms of the new one. With the binding cleared the next flush simply rebinds.
+		if ( evict->m_pair == m_ctx->m_pBoundPair )
+		{
+			m_ctx->m_pBoundPair = NULL;
+			m_ctx->m_bDirtyPrograms = true;
+		}
+
 		m_evictions[ rowIndex ]++;
 
 		// log eviction if desired
