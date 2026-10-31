@@ -3648,56 +3648,54 @@ static GLboolean isDXTcAlpha(GLenum format) {
     return 0;
 }
 
-GLvoid *uncompressDXTc(GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, int transparent0, int* simpleAlpha, int* complexAlpha, const GLvoid *data) {
-    // uncompress a DXTc image
-    // get pixel size of uncompressed image => fixed RGBA
-    int pixelsize = 4;
-    if (format == GL_COMPRESSED_RGB_S3TC_DXT1_EXT || format == GL_COMPRESSED_SRGB_S3TC_DXT1_EXT)
-        pixelsize = 3;
-    // check with the size of the input data stream if the stream is in fact uncompressed
-    if (imageSize == width*height*pixelsize || data==NULL) {
-        // uncompressed stream
-        return (GLvoid*)data;
-    }
-    // alloc memory
-    GLvoid *pixels = malloc(((width+3)&~3)*((height+3)&~3)*pixelsize);
-    // uncompress loop
-    int blocksize;
+static GLboolean isDXTc1(GLenum format) {
     switch (format) {
         case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
-        case GL_COMPRESSED_SRGB_S3TC_DXT1_EXT:
         case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
+        case GL_COMPRESSED_SRGB_S3TC_DXT1_EXT:
         case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT:
-            blocksize = 8;
+            return 1;
+    }
+    return 0;
+}
+
+// Bytes of one DXT level: 4x4 blocks of 8 (DXT1) or 16 (DXT3 / DXT5) bytes each, partial blocks at the right and
+// bottom edge included. This is also what a 1x1 or 2x2 mip occupies (one whole block).
+static size_t dxtcLevelBytes(GLsizei width, GLsizei height, GLenum format) {
+    const size_t blocks = (((size_t)width + 3) >> 2) * (((size_t)height + 3) >> 2);
+    return blocks * (isDXTc1(format) ? 8 : 16);
+}
+
+// Decodes one DXT level (DXT1 / DXT3 / DXT5, sRGB variants included) to tightly packed RGBA8: always 4 bytes per
+// pixel, row pitch = width. DXT1 without alpha comes out with alpha = 255, so there is no packed-RGB intermediate
+// buffer and no RGB -> RGBA padding pass any more. Nothing is written outside the width*height*4 byte buffer
+// (the per-block decoders used to wrap rows when the width was not a multiple of 4).
+// Returns a malloc'ed buffer the caller frees, or NULL when out of memory / not a DXT format.
+// The caller has checked that 'data' holds a whole level (dxtcLevelBytes()). The alpha flags of the decoder are not
+// needed here, so they are not asked for.
+static GLvoid *uncompressDXTc(GLsizei width, GLsizei height, GLenum format, int transparent0, const GLvoid *data) {
+    uint32_t *pixels = (uint32_t*)malloc((size_t)width * (size_t)height * 4);
+    if (!pixels)
+        return NULL;
+    const uint8_t *blocks = (const uint8_t*)data;
+    switch (format) {
+        case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+        case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
+        case GL_COMPRESSED_SRGB_S3TC_DXT1_EXT:
+        case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT:
+            DecompressImageDXT1((uint32_t)width, (uint32_t)height, blocks, transparent0, NULL, NULL, pixels);
             break;
         case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
-        case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
         case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
-        case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT:
-            blocksize = 16;
+            DecompressImageDXT3((uint32_t)width, (uint32_t)height, blocks, transparent0, NULL, NULL, pixels);
             break;
-    }
-    uintptr_t src = (uintptr_t) data;
-    for (int y=0; y<height; y+=4) {
-        for (int x=0; x<width; x+=4) {
-            switch(format) {
-                case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
-                case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
-                case GL_COMPRESSED_SRGB_S3TC_DXT1_EXT:
-                case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT:
-                    DecompressBlockDXT1(x, y, width, (uint8_t*)src, transparent0, simpleAlpha, complexAlpha, (uint32_t*)pixels);
-                    break;
-                case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
-                case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
-                    DecompressBlockDXT3(x, y, width, (uint8_t*)src, transparent0, simpleAlpha, complexAlpha, (uint32_t*)pixels);
-                    break;
-                case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
-                case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT:
-                    DecompressBlockDXT5(x, y, width, (uint8_t*)src, transparent0, simpleAlpha, complexAlpha, (uint32_t*)pixels);
-                    break;
-            }
-            src+=blocksize;
-        }
+        case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
+        case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT:
+            DecompressImageDXT5((uint32_t)width, (uint32_t)height, blocks, transparent0, NULL, NULL, pixels);
+            break;
+        default:
+            free(pixels);
+            return NULL;
     }
     return pixels;
 }
@@ -3720,7 +3718,9 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 	const size_t srcBytesPerPixel = hasAlpha ? 4 : 3;
 	bool srgb = false;
 	GLvoid *pixels = NULL;
-	bool ownsPixels = false;
+	bool ownsPixels = false;		// 'pixels' is our own malloc (the decoded level), not the caller's buffer
+	bool pixelsAreRGB = false;		// 'pixels' is tightly packed 3-byte RGB that still needs an alpha channel
+	bool dxtSource = false;			// the pixels come from a (lossy) DXT level: the encoder may trade a little quality for speed
 
 	uint64_t cacheKey = 0;
 	bool haveCacheKey = false;
@@ -3728,15 +3728,31 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 	if (isDXTc(internalformat))
 	{
 		srgb = isDXTcSRGB(internalformat) != 0;
-		int simpleAlpha = 0;
-		int complexAlpha = 0;
 		int transparent0 = (internalformat==GL_COMPRESSED_RGBA_S3TC_DXT1_EXT || internalformat==GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT)?1:0;
 
-		// The cache is keyed by the compressed DXT bytes (4-8x smaller than the decoded pixels), so a hit skips the
-		// DXT decode, the RGB padding and the encode: it is one table lookup and one read.
-		if ( data && imageSize > 0 )
+		// What is in 'data'? glCompressedTexImage2D carries DXT blocks, so DXT it is. The only other thing accepted is a
+		// buffer that is exactly width*height raw RGB(A) pixels and cannot be a DXT level: the old size test ("imageSize
+		// == width*height*bytes means raw") also fired for the tiny mips whose single DXT block happens to be as big as
+		// the raw pixels (DXT1 RGBA 2x1 / 1x2: 8 bytes, DXT3 / DXT5 2x2 / 4x1 / 1x4: 16 bytes), so those mips were
+		// uploaded as garbage.
+		const size_t dxtBytes = dxtcLevelBytes(width, height, internalformat);
+		const size_t rawBytes = (size_t)width * (size_t)height * srcBytesPerPixel;
+		const size_t haveBytes = (imageSize > 0) ? (size_t)imageSize : dxtBytes;		// no size given: trust the caller, as before
+		const bool isRaw = data && haveBytes == rawBytes && rawBytes != dxtBytes;
+
+		if (data && !isRaw && haveBytes < dxtBytes)
 		{
-			cacheKey = ASTC_ExternalCacheKey( data, (size_t)imageSize, (unsigned int)internalformat, (int)width, (int)height,
+			// Never read past the end of the caller's buffer: the level is left blank (storage only), like a call without data.
+			Warning("CompressedTexImage2D: %dx%d DXT level (format 0x%X) needs %u bytes but only %u were supplied; level %d is left blank\n",
+					(int)width, (int)height, (unsigned)internalformat, (unsigned)dxtBytes, (unsigned)haveBytes, (int)level);
+			data = NULL;
+		}
+
+		// The cache is keyed by the compressed DXT bytes (4-8x smaller than the decoded pixels), so a hit skips the
+		// DXT decode and the encode: it is one table lookup and one read.
+		if ( data )
+		{
+			cacheKey = ASTC_ExternalCacheKey( data, isRaw ? rawBytes : dxtBytes, (unsigned int)internalformat, (int)width, (int)height,
 											  /*isHDR=*/false, srgb, /*forceOpaque=*/!hasAlpha );
 			haveCacheKey = true;
 
@@ -3751,10 +3767,17 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 		}
 
 		if (data) {
-			pixels = uncompressDXTc(width, height, internalformat, imageSize, transparent0, &simpleAlpha, &complexAlpha, data);
-			// uncompressDXTc() hands back the caller's own pointer when the stream is already uncompressed,
-			// so only free what we allocated ourselves.
-			ownsPixels = ( pixels != NULL ) && ( pixels != data );
+			if (isRaw) {
+				// the caller already handed us decoded pixels (RGBA, or tightly packed RGB for DXT1 without alpha)
+				pixels = (GLvoid*)data;
+				pixelsAreRGB = !hasAlpha;
+			} else {
+				pixels = uncompressDXTc(width, height, internalformat, transparent0, data);
+				if (!pixels)
+					Error( "CompressedTexImage2D: out of memory decoding a %dx%d DXT level\n", (int)width, (int)height );
+				ownsPixels = true;
+				dxtSource = true;
+			}
 		}
 	}
 	else if ( data && (size_t)imageSize >= (size_t)width * (size_t)height * srcBytesPerPixel )
@@ -3764,8 +3787,8 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 	}
 
 	// Mandatory: DXT bytes are never pushed to the GPU, not even when the driver natively supports
-	// GL_EXT_texture_compression_dxt1. uncompressDXTc() decoded the source to tightly packed RGB (DXT1 without
-	// alpha) or RGBA; re-encode those pixels as ASTC. DXT is always 8-bit normalized color, so always LDR.
+	// GL_EXT_texture_compression_dxt1. The level was decoded to RGBA above (DXT1 without alpha included, alpha = 255);
+	// re-encode those pixels as ASTC. DXT is always 8-bit normalized color, so always LDR.
 	if ( !pixels )
 	{
 		// Storage-only definition (no source data, or nothing decodable): define the level as blank ASTC blocks.
@@ -3782,9 +3805,9 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 	const void *rgbaSrc = pixels;
 	uint8_t *paddedRGBA = NULL;
 
-	if ( !hasAlpha )
+	if ( pixelsAreRGB )
 	{
-		// DXT1-no-alpha decodes to tightly packed 3-byte RGB; ASTC encoding wants 4-byte RGBA,
+		// Raw 3-byte RGB (only a caller that bypassed the DXT stream gets here); ASTC encoding wants 4-byte RGBA,
 		// so pad in an opaque alpha channel.
 		const size_t nPixels = (size_t)width * (size_t)height;
 		const uint8_t *rgb = (const uint8_t*)pixels;
@@ -3813,7 +3836,7 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 	bool bEncodeFailed = false;
 	// The result is stored under the DXT-source key below, so the encoder's own pixel-keyed cache is not used here.
 	ASTC_CompressTextureRequired( /*isHDR=*/false, srgb, /*forceOpaque=*/!hasAlpha, rgbaSrc, width, height,
-								  GL_RGBA, GL_UNSIGNED_BYTE, &astcResult, /*allowDiskCache=*/false, &bEncodeFailed );
+								  GL_RGBA, GL_UNSIGNED_BYTE, &astcResult, /*allowDiskCache=*/false, &bEncodeFailed, dxtSource );
 
 	if ( haveCacheKey && !bEncodeFailed )
 		ASTC_CacheStore( cacheKey, &astcResult );
