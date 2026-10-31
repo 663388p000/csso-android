@@ -12,10 +12,11 @@
 /*
 DXT1/DXT3/DXT5 texture decompression
 
-ARM / Mali port: on AArch64 the three public entry points below run NEON block decoders (see the
-"NEON block decoders" section at the end of this file). They produce exactly the same bytes and the
-same simpleAlpha / complexAlpha flags as the scalar code in this file, which is kept as the reference
-(DecompressBlockDXT*_Scalar) and is what runs on every other CPU or when TOGL_DISABLE_ARM_NEON is defined.
+ARM / Mali port: on AArch64 the public entry points below run NEON decoders (see the "NEON block decoders"
+and "NEON whole-image kernels" sections). They produce exactly the same bytes and the same simpleAlpha /
+complexAlpha flags as the scalar code in this file, which is kept as the reference (DecompressBlockDXT*_Scalar)
+and is what runs on every other CPU or when TOGL_DISABLE_ARM_NEON is defined.
+DecompressImageDXT1/3/5 decode a whole mip level per call; that is what the texture upload path uses.
 
 The original code is from Benjamin Dobell, see below for details. Compared to
 the original this one adds DXT3 decompression, is valid C89, and is x64 
@@ -712,6 +713,344 @@ static void Dxt5_Neon( const uint8_t* block, uint32_t* output, uint32_t outputSt
 	DxtAlphaFlags( alpha, simpleAlpha, complexAlpha );
 }
 
+/* ========================================================================== */
+/*  NEON whole-image kernels                                                  */
+/*                                                                            */
+/*  Used by DecompressImageDXT1/3/5() below. Compared with the per-block      */
+/*  decoders above:                                                           */
+/*   - the 4-entry palette is built in vector registers (no stores to the     */
+/*     stack followed by a vector load, which stalls on in-order cores)       */
+/*   - the DXT5 alpha palette is built with vector maths, not a scalar loop   */
+/*   - the four row index vectors come from a 4 KB lookup table indexed by    */
+/*     the selector byte of that row                                          */
+/*   - the output is always RGBA (alpha 255 for opaque DXT1), so the caller   */
+/*     needs neither the 3-byte RGB buffer nor a second RGB -> RGBA pass      */
+/*   - alpha flags are only computed when the caller asks for them            */
+/*   - runs of four complete blocks ( 16 pixels ) are decoded stage by stage  */
+/*     ( four palettes, then four alpha tables, then the rows ), so the       */
+/*     dependency chains of the four blocks overlap on in-order cores.        */
+/*     llvm-mca ( Cortex-A55 / A76 models, estimate only ): about 1.4x - 2x   */
+/*     fewer cycles per block than the per-block decoders above               */
+/*  Every arithmetic step is the same integer maths as the scalar reference.  */
+/* ========================================================================== */
+
+/* Row index vector for a selector byte b (four 2-bit selectors s0..s3):
+   lane 4*c + k = 4 * s_c + k, i.e. the byte indices of RGBA palette entry s_c. */
+#define DXT_ROW_IDX( b ) { \
+	4*(((b)>>0)&3)+0, 4*(((b)>>0)&3)+1, 4*(((b)>>0)&3)+2, 4*(((b)>>0)&3)+3, \
+	4*(((b)>>2)&3)+0, 4*(((b)>>2)&3)+1, 4*(((b)>>2)&3)+2, 4*(((b)>>2)&3)+3, \
+	4*(((b)>>4)&3)+0, 4*(((b)>>4)&3)+1, 4*(((b)>>4)&3)+2, 4*(((b)>>4)&3)+3, \
+	4*(((b)>>6)&3)+0, 4*(((b)>>6)&3)+1, 4*(((b)>>6)&3)+2, 4*(((b)>>6)&3)+3 }
+#define DXT_ROW_IDX4( n )  DXT_ROW_IDX( n ), DXT_ROW_IDX( (n) + 1 ), DXT_ROW_IDX( (n) + 2 ), DXT_ROW_IDX( (n) + 3 )
+#define DXT_ROW_IDX16( n ) DXT_ROW_IDX4( n ), DXT_ROW_IDX4( (n) + 4 ), DXT_ROW_IDX4( (n) + 8 ), DXT_ROW_IDX4( (n) + 12 )
+#define DXT_ROW_IDX64( n ) DXT_ROW_IDX16( n ), DXT_ROW_IDX16( (n) + 16 ), DXT_ROW_IDX16( (n) + 32 ), DXT_ROW_IDX16( (n) + 48 )
+
+static const uint8_t kDxtRowIdx[256][16] =
+{
+	DXT_ROW_IDX64( 0 ), DXT_ROW_IDX64( 64 ), DXT_ROW_IDX64( 128 ), DXT_ROW_IDX64( 192 )
+};
+
+/* DXT3/DXT5: the colour table is palette bytes 0..15, the alpha table is bytes 16..31 of a 32 byte tbl source.
+   Alpha lanes (3, 7, 11, 15) take the index of the pixel's alpha byte instead of the palette lookup. */
+static const uint8_t kDxtAlphaMask[16] = { 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255 };
+static const uint8_t kDxtAlphaIdx[4][16] =
+{
+	{ 0,0,0,16,  0,0,0,17,  0,0,0,18,  0,0,0,19 },
+	{ 0,0,0,20,  0,0,0,21,  0,0,0,22,  0,0,0,23 },
+	{ 0,0,0,24,  0,0,0,25,  0,0,0,26,  0,0,0,27 },
+	{ 0,0,0,28,  0,0,0,29,  0,0,0,30,  0,0,0,31 }
+};
+
+/* DXT5 alpha palette: entry c = ( WA[c] * a0 + WB[c] * a1 ) / D, D = 7 when a0 > a1, 5 otherwise.
+   Division by a reciprocal multiply (vqdmulh: ( 2 * x * R ) >> 16), exact for every x <= 7 * 255 (checked by the test). */
+static const uint16_t kDxt5WA[2][8]  = { { 7, 0, 6, 5, 4, 3, 2, 1 }, { 5, 0, 4, 3, 2, 1, 0, 0 } };
+static const uint16_t kDxt5WB[2][8]  = { { 0, 7, 1, 2, 3, 4, 5, 6 }, { 0, 5, 1, 2, 3, 4, 0, 0 } };
+static const int16_t  kDxt5Rcp[2][8] = { { 4682, 4682, 4682, 4682, 4682, 4682, 4682, 4682 },
+										 { 6554, 6554, 6554, 6554, 6554, 6554, 6554, 6554 } };
+static const uint8_t  kDxt5Or[2][8]  = { { 0, 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0, 255 } };	/* 6-entry mode: entry 7 = 255 */
+
+/* DXT3 explicit alpha: 4 bits per pixel, two pixels per byte */
+static const uint8_t kDxtNibIdx[16] = { 0,0,1,1,2,2,3,3, 4,4,5,5,6,6,7,7 };
+static const int8_t  kDxtNibShl[16] = { 4,0,4,0,4,0,4,0, 4,0,4,0,4,0,4,0 };
+
+/* Colour endpoints. A colour word w = color0 | color1 << 16 becomes [e0 | e1]: eight u16 lanes r g b a of the expanded 8-bit
+   endpoint 0, then of endpoint 1 (the alpha lanes come out as 255).
+   The 5 / 6 bit channel value c is moved to bit 10 (r, b) or bit 9 (g) of its lane and multiplied with vqrdmulh by 263 / 259, which is
+       r, b:  ( c * 263 + 16 ) >> 5          g:  ( c * 259 + 32 ) >> 6
+   and equals the scalar (t / 32 + t) / 32 with t = c * 255 + 16 ( (t / 64 + t) / 64 with t = c * 255 + 32 for g ) for every value of c
+   (the tests cover all 65536 colour words). One shift, one select and one multiply expand both endpoints, with no separate
+   mask / bias / shift steps. */
+static const uint8_t  kDxtDupIdx[16] = { 0,1,0,1,0,1,0,1, 2,3,2,3,2,3,2,3 };	/* [c0 c1 c0 c1 ...] -> [c0 x4 | c1 x4] */
+static const int16_t  kDxtEShr[8]    = { -1, 4, 10, 0, -1, 4, 10, 0 };
+static const uint16_t kDxtEKeep[8]   = { 0x7C00, 0x7E00, 0x7C00, 0, 0x7C00, 0x7E00, 0x7C00, 0 };
+static const uint16_t kDxtEPad[8]    = { 0, 0, 0, 0x7C00, 0, 0, 0, 0x7C00 };	/* 31 << 10 in the alpha lane: expands to 255 */
+static const int16_t  kDxtEMul[8]    = { 263, 259, 263, 263, 263, 259, 263, 263 };
+static const uint16_t kDxtELo[8]     = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0, 0 };
+
+typedef struct DxtK
+{
+	uint8x16_t	dupIdx;
+	int16x8_t	eShr;
+	uint16x8_t	eKeep, ePad, eLo;
+	int16x8_t	eMul;
+	int16x8_t	third;			/* 10923: vqdmulh by this is an exact division by 3 for the values used here ( <= 3 * 255 ) */
+	uint8x16_t	alphaMask;		/* 0,0,0,255 per pixel */
+} DxtK;
+
+ARMOPT_TINY void DxtKInit( DxtK* k )
+{
+	k->dupIdx    = vld1q_u8( kDxtDupIdx );
+	k->eShr      = vld1q_s16( kDxtEShr );
+	k->eKeep     = vld1q_u16( kDxtEKeep );
+	k->ePad      = vld1q_u16( kDxtEPad );
+	k->eLo       = vld1q_u16( kDxtELo );
+	k->eMul      = vld1q_s16( kDxtEMul );
+	k->third     = vdupq_n_s16( 10923 );
+	k->alphaMask = vld1q_u8( kDxtAlphaMask );
+}
+
+/* lane 7 = alpha3, everything else 0: entry 3 of a 3-colour palette ( 0, 0, 0, alpha3 ) */
+ARMOPT_TINY uint16x8_t DxtAlpha3Vec( uint32_t alpha3 )
+{
+	return vcombine_u16( vdup_n_u16( 0 ), vcreate_u16( (uint64_t)( alpha3 & 0xFFu ) << 48 ) );
+}
+
+/* [e0 | e1] of one colour word */
+ARMOPT_TINY uint16x8_t DxtEnds( const DxtK* k, uint32_t w )
+{
+	uint16x8_t a = vreinterpretq_u16_u8( vqtbl1q_u8( vreinterpretq_u8_u32( vdupq_n_u32( w ) ), k->dupIdx ) );
+	a = vshlq_u16( a, k->eShr );
+	a = vbslq_u16( k->eKeep, a, k->ePad );
+	return vreinterpretq_u16_s16( vqrdmulhq_s16( vreinterpretq_s16_u16( a ), k->eMul ) );
+}
+
+/* Palette (4 RGBA entries, 16 bytes) for a 4-colour block: entries 2, 3 = ( 2 * e0 + e1 ) / 3 and ( e0 + 2 * e1 ) / 3. All alpha 255. */
+ARMOPT_TINY uint8x16_t DxtPal4( const DxtK* k, uint32_t w )
+{
+	uint16x8_t e = DxtEnds( k, w );
+	uint16x8_t y = vextq_u16( e, e, 4 );											/* [e1 | e0] */
+	uint16x8_t s = vaddq_u16( vaddq_u16( e, e ), y );								/* [2 e0 + e1 | 2 e1 + e0] */
+	uint16x8_t q = vreinterpretq_u16_s16( vqdmulhq_s16( vreinterpretq_s16_u16( s ), k->third ) );
+	return vuzp1q_u8( vreinterpretq_u8_u16( e ), vreinterpretq_u8_u16( q ) );
+}
+
+/* Same, and a 3-colour block ( mode3 != 0, color0 <= color1 ) gets entry 2 = ( e0 + e1 ) / 2 and entry 3 = ( 0, 0, 0, alpha3 ) ( p3k = DxtAlpha3Vec() ). */
+ARMOPT_TINY uint8x16_t DxtPalG( const DxtK* k, uint32_t w, int mode3, uint16x8_t p3k )
+{
+	uint16x8_t e = DxtEnds( k, w );
+	uint16x8_t y = vextq_u16( e, e, 4 );
+	uint16x8_t s = vaddq_u16( vaddq_u16( e, e ), y );
+	uint16x8_t q = vreinterpretq_u16_s16( vqdmulhq_s16( vreinterpretq_s16_u16( s ), k->third ) );
+	uint16x8_t h = vbslq_u16( k->eLo, vhaddq_u16( e, y ), p3k );					/* [( e0 + e1 ) / 2 | ( 0, 0, 0, alpha3 )] */
+	q = vbslq_u16( vdupq_n_u16( (uint16_t)( 0u - (uint32_t)( mode3 != 0 ) ) ), h, q );
+	return vuzp1q_u8( vreinterpretq_u8_u16( e ), vreinterpretq_u8_u16( q ) );
+}
+
+/* four rows of an RGBA palette lookup */
+ARMOPT_TINY void DxtStoreRows4( uint8x16_t pal, uint32_t code, uint8_t* out, size_t strideBytes )
+{
+	vst1q_u8( out,                      vqtbl1q_u8( pal, vld1q_u8( kDxtRowIdx[ code & 255u ] ) ) );
+	vst1q_u8( out + strideBytes,        vqtbl1q_u8( pal, vld1q_u8( kDxtRowIdx[ ( code >> 8 ) & 255u ] ) ) );
+	vst1q_u8( out + 2 * strideBytes,    vqtbl1q_u8( pal, vld1q_u8( kDxtRowIdx[ ( code >> 16 ) & 255u ] ) ) );
+	vst1q_u8( out + 3 * strideBytes,    vqtbl1q_u8( pal, vld1q_u8( kDxtRowIdx[ code >> 24 ] ) ) );
+}
+
+/* one row with per-pixel alpha: colour lookup and alpha lookup in one two-register tbl ( table bytes 0..15 = palette, 16..31 = alpha[16] in pixel order ) */
+ARMOPT_TINY uint8x16_t DxtRowAlpha( const DxtK* k, uint8x16x2_t tab, uint32_t sel, int r )
+{
+	return vqtbl2q_u8( tab, vbslq_u8( k->alphaMask, vld1q_u8( kDxtAlphaIdx[ r ] ), vld1q_u8( kDxtRowIdx[ sel ] ) ) );
+}
+
+/* four rows of colour lookup + per-pixel alpha (alpha[16] in pixel order) */
+ARMOPT_TINY void DxtStoreRows3( const DxtK* k, uint8x16_t pal, uint8x16_t alpha, uint32_t code, uint8_t* out, size_t strideBytes )
+{
+	uint8x16x2_t tab;
+
+	tab.val[0] = pal;
+	tab.val[1] = alpha;
+
+	vst1q_u8( out,                      DxtRowAlpha( k, tab, code & 255u, 0 ) );
+	vst1q_u8( out + strideBytes,        DxtRowAlpha( k, tab, ( code >> 8 ) & 255u, 1 ) );
+	vst1q_u8( out + 2 * strideBytes,    DxtRowAlpha( k, tab, ( code >> 16 ) & 255u, 2 ) );
+	vst1q_u8( out + 3 * strideBytes,    DxtRowAlpha( k, tab, code >> 24, 3 ) );
+}
+
+/* DXT3: the 8 alpha bytes at p -> 16 alpha bytes in pixel order ( nibble * 17 ) */
+ARMOPT_TINY uint8x16_t DxtAlpha3( const uint8_t* p )
+{
+	uint8x16_t t = vqtbl1q_u8( vcombine_u8( vld1_u8( p ), vdup_n_u8( 0 ) ), vld1q_u8( kDxtNibIdx ) );	/* every byte twice */
+	t = vshlq_u8( t, vld1q_s8( kDxtNibShl ) );															/* even pixel: low nibble up, odd pixel: high nibble stays */
+	t = vandq_u8( t, vdupq_n_u8( 0xF0 ) );
+	return vsraq_n_u8( t, t, 4 );																		/* n << 4 + n = n * 17 */
+}
+
+/* DXT5: the 8 alpha bytes at p ( two endpoints + 48 bits of 3-bit selectors ) -> 16 alpha bytes in pixel order */
+ARMOPT_TINY uint8x16_t DxtAlpha5( const uint8_t* p )
+{
+	const uint32_t a0 = p[0];
+	const uint32_t a1 = p[1];
+	const int m5 = ( a0 > a1 ) ? 0 : 1;					/* 0: 8-entry palette ( / 7 ), 1: 6-entry palette ( / 5 ) */
+	uint16x8_t x, wlo, whi;
+	uint8x8_t pal8;
+	uint8x16_t bv, idx3;
+	int16x8_t sh;
+
+	/* 8-entry alpha palette */
+	x = vmlaq_u16( vmulq_u16( vdupq_n_u16( (uint16_t)a0 ), vld1q_u16( kDxt5WA[ m5 ] ) ),
+				   vdupq_n_u16( (uint16_t)a1 ), vld1q_u16( kDxt5WB[ m5 ] ) );
+	x = vreinterpretq_u16_s16( vqdmulhq_s16( vreinterpretq_s16_u16( x ), vld1q_s16( kDxt5Rcp[ m5 ] ) ) );
+	pal8 = vorr_u8( vmovn_u16( x ), vld1_u8( kDxt5Or[ m5 ] ) );
+
+	/* selectors: bytes 2..7 of the block. The 8 bytes read here also include the first two colour bytes, but every selector's
+	   16-bit window ends at byte 7 at the latest and the & 7 below drops everything above the selector's three bits. */
+	bv  = vcombine_u8( vld1_u8( p + 2 ), vdup_n_u8( 0 ) );
+	wlo = vreinterpretq_u16_u8( vqtbl1q_u8( bv, vld1q_u8( kDxt5WinLo ) ) );
+	whi = vreinterpretq_u16_u8( vqtbl1q_u8( bv, vld1q_u8( kDxt5WinHi ) ) );
+	sh  = vld1q_s16( kDxt5Shr );
+	wlo = vshlq_u16( wlo, sh );
+	whi = vshlq_u16( whi, sh );
+	idx3 = vandq_u8( vuzp1q_u8( vreinterpretq_u8_u16( wlo ), vreinterpretq_u8_u16( whi ) ), vdupq_n_u8( 7 ) );
+	return vqtbl1q_u8( vcombine_u8( pal8, vdup_n_u8( 0 ) ), idx3 );
+}
+
+/* ---- one block ---- */
+
+/* DXT1 block -> 4 rows of RGBA. alpha3 = 0 gives the 1-bit-alpha behaviour (transparent0), 255 keeps every texel opaque. */
+ARMOPT_TINY void DxtBlock1( const DxtK* k, const uint8_t* b, uint8_t* out, size_t strideBytes, uint32_t alpha3, int* simpleAlpha )
+{
+	uint32_t w, code;
+	int mode3;
+
+	memcpy( &w, b, 4 );
+	memcpy( &code, b + 4, 4 );
+	mode3 = ( w & 0xFFFFu ) <= ( w >> 16 );
+
+	DxtStoreRows4( DxtPalG( k, w, mode3, DxtAlpha3Vec( alpha3 ) ), code, out, strideBytes );
+
+	/* a texel is transparent when its selector is 3 in a 3-colour block ( both selector bits set ) */
+	if ( simpleAlpha && mode3 && alpha3 == 0 && ( code & ( code >> 1 ) & 0x55555555u ) != 0 )
+		*simpleAlpha = 1;
+}
+
+/* DXT3 block: 8 bytes of 4-bit alpha, then a DXT1 colour block (3-colour mode allowed, like the scalar reference) */
+ARMOPT_TINY void DxtBlock3( const DxtK* k, const uint8_t* b, uint8_t* out, size_t strideBytes, int transparent0, int* simpleAlpha, int* complexAlpha )
+{
+	uint32_t w, code;
+	uint8x16_t alpha;
+	int mode3;
+
+	alpha = DxtAlpha3( b );
+
+	memcpy( &w, b + 8, 4 );
+	memcpy( &code, b + 12, 4 );
+	mode3 = ( w & 0xFFFFu ) <= ( w >> 16 );
+
+	if ( mode3 && transparent0 )						/* selector 3 of a 3-colour block is fully transparent */
+		alpha = vbicq_u8( alpha, vceqq_u8( Dxt2BitCodes( code ), vdupq_n_u8( 3 ) ) );
+
+	DxtStoreRows3( k, DxtPalG( k, w, mode3, DxtAlpha3Vec( 255 ) ), alpha, code, out, strideBytes );
+
+	if ( simpleAlpha && complexAlpha )
+		DxtAlphaFlags( alpha, simpleAlpha, complexAlpha );
+}
+
+/* DXT5 block: two alpha endpoints + 48 bits of 3-bit selectors, then a colour block (always 4-colour) */
+ARMOPT_TINY void DxtBlock5( const DxtK* k, const uint8_t* b, uint8_t* out, size_t strideBytes, int* simpleAlpha, int* complexAlpha )
+{
+	uint32_t w, code;
+	uint8x16_t alpha;
+
+	alpha = DxtAlpha5( b );
+
+	memcpy( &w, b + 8, 4 );
+	memcpy( &code, b + 12, 4 );
+
+	DxtStoreRows3( k, DxtPal4( k, w ), alpha, code, out, strideBytes );
+
+	if ( simpleAlpha && complexAlpha )
+		DxtAlphaFlags( alpha, simpleAlpha, complexAlpha );
+}
+
+/* ---- four blocks side by side ( 16 pixels wide ) ----
+   Every stage runs for all four blocks before the next stage starts. The blocks are independent, so the long dependency
+   chains of the palette maths overlap instead of each stalling an in-order core, and the constants stay in registers.
+   Only for complete blocks, and when the caller does not want the alpha flags. */
+#define DXT_X4( ... ) \
+	{ const int j = 0; __VA_ARGS__ } \
+	{ const int j = 1; __VA_ARGS__ } \
+	{ const int j = 2; __VA_ARGS__ } \
+	{ const int j = 3; __VA_ARGS__ }
+
+/* rows 0..3 of four palettes ( pal[j] ) with the selector words code[j]; rowStore( r, j ) writes row r of block j */
+#define DXT_ROWS4( ... ) \
+	{ const int r = 0; DXT_X4( __VA_ARGS__ ) } \
+	{ const int r = 1; DXT_X4( __VA_ARGS__ ) } \
+	{ const int r = 2; DXT_X4( __VA_ARGS__ ) } \
+	{ const int r = 3; DXT_X4( __VA_ARGS__ ) }
+
+ARMOPT_TINY void DxtGroup1( const DxtK* k, const uint8_t* b, uint8_t* out, size_t st, uint32_t alpha3 )
+{
+	uint32_t w[4], code[4];
+	uint8x16_t pal[4];
+	int any3 = 0;
+
+	DXT_X4( memcpy( &w[j], b + 8 * j, 4 ); memcpy( &code[j], b + 8 * j + 4, 4 ); any3 |= ( ( w[j] & 0xFFFFu ) <= ( w[j] >> 16 ) ); )
+
+	if ( any3 )
+	{
+		const uint16x8_t p3k = DxtAlpha3Vec( alpha3 );
+		DXT_X4( pal[j] = DxtPalG( k, w[j], ( w[j] & 0xFFFFu ) <= ( w[j] >> 16 ), p3k ); )
+	}
+	else
+	{
+		DXT_X4( pal[j] = DxtPal4( k, w[j] ); )
+	}
+
+	DXT_ROWS4( vst1q_u8( out + 16 * j + r * st, vqtbl1q_u8( pal[j], vld1q_u8( kDxtRowIdx[ ( code[j] >> ( 8 * r ) ) & 255u ] ) ) ); )
+}
+
+/* returns 0 when it cannot take the group ( transparent0 with a 3-colour block ): the caller decodes the four blocks one by one */
+ARMOPT_TINY int DxtGroup3( const DxtK* k, const uint8_t* b, uint8_t* out, size_t st, int transparent0 )
+{
+	uint32_t w[4], code[4];
+	uint8x16_t pal[4], al[4];
+	int any3 = 0;
+
+	DXT_X4( memcpy( &w[j], b + 16 * j + 8, 4 ); memcpy( &code[j], b + 16 * j + 12, 4 ); any3 |= ( ( w[j] & 0xFFFFu ) <= ( w[j] >> 16 ) ); )
+
+	if ( any3 && transparent0 )
+		return 0;
+
+	DXT_X4( al[j] = DxtAlpha3( b + 16 * j ); )
+
+	if ( any3 )
+	{
+		const uint16x8_t p3k = DxtAlpha3Vec( 255 );
+		DXT_X4( pal[j] = DxtPalG( k, w[j], ( w[j] & 0xFFFFu ) <= ( w[j] >> 16 ), p3k ); )
+	}
+	else
+	{
+		DXT_X4( pal[j] = DxtPal4( k, w[j] ); )
+	}
+
+	DXT_ROWS4( { uint8x16x2_t tab; tab.val[0] = pal[j]; tab.val[1] = al[j];
+				 vst1q_u8( out + 16 * j + r * st, DxtRowAlpha( k, tab, ( code[j] >> ( 8 * r ) ) & 255u, r ) ); } )
+	return 1;
+}
+
+ARMOPT_TINY void DxtGroup5( const DxtK* k, const uint8_t* b, uint8_t* out, size_t st )
+{
+	uint32_t w[4], code[4];
+	uint8x16_t pal[4], al[4];
+
+	DXT_X4( memcpy( &w[j], b + 16 * j + 8, 4 ); memcpy( &code[j], b + 16 * j + 12, 4 ); )
+	DXT_X4( al[j] = DxtAlpha5( b + 16 * j ); )
+	DXT_X4( pal[j] = DxtPal4( k, w[j] ); )
+
+	DXT_ROWS4( { uint8x16x2_t tab; tab.val[0] = pal[j]; tab.val[1] = al[j];
+				 vst1q_u8( out + 16 * j + r * st, DxtRowAlpha( k, tab, ( code[j] >> ( 8 * r ) ) & 255u, r ) ); } )
+}
+
 #endif /* ARMOPT_NEON64 */
 
 /* ========================================================================== */
@@ -756,5 +1095,222 @@ void DecompressBlockDXT3(uint32_t x, uint32_t y, uint32_t width,
 	Dxt3_Neon( blockStorage, image + x + (y * width), width, transparent0, simpleAlpha, complexAlpha );
 #else
 	DecompressBlockDXT3_Scalar( x, y, width, blockStorage, transparent0, simpleAlpha, complexAlpha, image );
+#endif
+}
+
+/* ========================================================================== */
+/*  Whole-image decoders                                                      */
+/*                                                                            */
+/*  DecompressImageDXT1/3/5() decode a complete mip level ( ceil(w/4) * ceil(h/4) blocks, row major )  */
+/*  into tightly packed RGBA8: row pitch = width pixels, exactly width * height * 4 bytes are written, */
+/*  also when width / height are not multiples of 4 ( edge blocks are clipped ).                       */
+/*                                                                            */
+/*  Compared with calling DecompressBlockDXT*() once per block:               */
+/*   - DXT1 without alpha ( transparent0 == 0 ) comes out as RGBA with alpha 255, so the caller no     */
+/*     longer needs a 3-byte RGB buffer plus a second RGB -> RGBA pass                                */
+/*   - edge blocks never write outside the image ( the per-block scalar code wraps rows when the      */
+/*     width is not a multiple of 4 )                                                                 */
+/*   - simpleAlpha / complexAlpha are only ever set to 1, as before, and only computed when asked for  */
+/*  Visible pixels and the alpha flags are bit-identical to the per-block decoders.                   */
+/* ========================================================================== */
+
+typedef void ( *DxtScalarBlockFn )( uint32_t x, uint32_t y, uint32_t width, const uint8_t* blockStorage,
+									int transparent0, int* simpleAlpha, int* complexAlpha, uint32_t* image );
+
+/* DecompressBlockDXT1_Scalar() writes packed RGB when transparent0 is 0; the image decoder wants RGBA with alpha 255 */
+DXT_SCALAR_FN void DxtBlock1Rgba_Scalar( uint32_t x, uint32_t y, uint32_t width, const uint8_t* blockStorage,
+										 int transparent0, int* simpleAlpha, int* complexAlpha, uint32_t* image )
+{
+	static const uint8_t const_alpha [] = {
+		255, 255, 255, 255,
+		255, 255, 255, 255,
+		255, 255, 255, 255,
+		255, 255, 255, 255
+	};
+
+	DecompressBlockDXT1Internal( blockStorage, image + x + ( (size_t)y * width ), width,
+								 transparent0, simpleAlpha, complexAlpha, const_alpha );
+}
+
+/* Portable reference: block by block through the scalar decoders, edge blocks via a 4x4 scratch block */
+DXT_SCALAR_FN void DxtImage_Scalar( DxtScalarBlockFn fn, uint32_t blockBytes, uint32_t width, uint32_t height,
+									const uint8_t* blocks, int transparent0, int* simpleAlpha, int* complexAlpha,
+									uint32_t* rgba )
+{
+	const uint32_t bw = ( width + 3 ) >> 2;
+	const uint32_t bh = ( height + 3 ) >> 2;
+	uint32_t bx, by, j;
+	uint32_t tmp[16];
+	int sa = 0, ca = 0;
+
+	for ( by = 0; by < bh; ++by )
+	{
+		for ( bx = 0; bx < bw; ++bx )
+		{
+			const uint8_t* blk = blocks + ( (size_t)by * bw + bx ) * blockBytes;
+			const uint32_t x = bx * 4;
+			const uint32_t y = by * 4;
+
+			if ( x + 4 <= width && y + 4 <= height )
+			{
+				fn( x, y, width, blk, transparent0, &sa, &ca, rgba );
+			}
+			else
+			{
+				const uint32_t vw = ( width - x < 4 ) ? ( width - x ) : 4;
+				const uint32_t vh = ( height - y < 4 ) ? ( height - y ) : 4;
+
+				fn( 0, 0, 4, blk, transparent0, &sa, &ca, tmp );
+				for ( j = 0; j < vh; ++j )
+					memcpy( rgba + (size_t)( y + j ) * width + x, tmp + j * 4, (size_t)vw * 4 );
+			}
+		}
+	}
+
+	if ( simpleAlpha && sa )
+		*simpleAlpha = 1;
+	if ( complexAlpha && ca )
+		*complexAlpha = 1;
+}
+
+#if ARMOPT_NEON64
+
+/* one block, selected at compile time ( kind is a constant after inlining ) */
+ARMOPT_TINY void DxtBlockAny( const DxtK* k, int kind, const uint8_t* blk, uint8_t* out, size_t strideBytes, int transparent0,
+							  uint32_t alpha3, int* sa, int* ca )
+{
+	if ( kind == 1 )
+		DxtBlock1( k, blk, out, strideBytes, alpha3, sa );
+	else if ( kind == 3 )
+		DxtBlock3( k, blk, out, strideBytes, transparent0, sa, ca );
+	else
+		DxtBlock5( k, blk, out, strideBytes, sa, ca );
+}
+
+/* four complete blocks side by side; 0 = the group kernel cannot take them ( the caller decodes them one by one ) */
+ARMOPT_TINY int DxtGroupAny( const DxtK* k, int kind, const uint8_t* blk, uint8_t* out, size_t strideBytes, int transparent0,
+							 uint32_t alpha3 )
+{
+	if ( kind == 1 )
+	{
+		DxtGroup1( k, blk, out, strideBytes, alpha3 );
+		return 1;
+	}
+	if ( kind == 3 )
+		return DxtGroup3( k, blk, out, strideBytes, transparent0 );
+
+	DxtGroup5( k, blk, out, strideBytes );
+	return 1;
+}
+
+ARMOPT_TINY void DxtImage_Neon( int kind, uint32_t width, uint32_t height, const uint8_t* blocks, int transparent0,
+								int* simpleAlpha, int* complexAlpha, uint32_t* rgba )
+{
+	const uint32_t bw = ( width + 3 ) >> 2;
+	const uint32_t bh = ( height + 3 ) >> 2;
+	const uint32_t fullBw = width >> 2;							/* complete blocks per row */
+	const size_t blockBytes = ( kind == 1 ) ? 8 : 16;
+	const size_t strideBytes = (size_t)width * 4;
+	const uint32_t alpha3 = transparent0 ? 0u : 255u;			/* DXT1 only: alpha of selector 3 in a 3-colour block */
+	const int wantFlags = ( simpleAlpha != NULL ) || ( complexAlpha != NULL );
+	int sa = 0, ca = 0;
+	int* psa = wantFlags ? &sa : NULL;
+	int* pca = wantFlags ? &ca : NULL;
+	uint8_t* dst = (uint8_t*)rgba;
+	uint8_t tmp[64];
+	uint32_t bx, by, j;
+	DxtK k;
+
+	DxtKInit( &k );
+
+	for ( by = 0; by < bh; ++by )
+	{
+		const uint32_t y = by * 4;
+		const uint8_t* blk = blocks + (size_t)by * bw * blockBytes;
+		uint8_t* row = dst + (size_t)y * strideBytes;
+
+		bx = 0;
+
+		/* runs of four complete blocks ( 16 pixels ) go through the group kernels; they do not compute the alpha flags */
+		if ( !wantFlags && y + 4 <= height )
+		{
+			for ( ; bx + 4 <= fullBw; bx += 4, blk += 4 * blockBytes )
+			{
+				uint8_t* o = row + (size_t)bx * 16;
+
+				if ( !DxtGroupAny( &k, kind, blk, o, strideBytes, transparent0, alpha3 ) )
+				{
+					for ( j = 0; j < 4; ++j )
+						DxtBlockAny( &k, kind, blk + j * blockBytes, o + (size_t)j * 16, strideBytes, transparent0, alpha3, NULL, NULL );
+				}
+			}
+		}
+
+		for ( ; bx < bw; ++bx, blk += blockBytes )
+		{
+			const uint32_t x = bx * 4;
+
+			if ( x + 4 <= width && y + 4 <= height )
+			{
+				DxtBlockAny( &k, kind, blk, row + (size_t)x * 4, strideBytes, transparent0, alpha3, psa, pca );
+			}
+			else
+			{
+				/* edge block: decode the whole 4x4 into scratch, copy only the visible part */
+				const uint32_t vw = ( width - x < 4 ) ? ( width - x ) : 4;
+				const uint32_t vh = ( height - y < 4 ) ? ( height - y ) : 4;
+
+				DxtBlockAny( &k, kind, blk, tmp, 16, transparent0, alpha3, psa, pca );
+				for ( j = 0; j < vh; ++j )
+					memcpy( row + (size_t)j * strideBytes + (size_t)x * 4, tmp + (size_t)j * 16, (size_t)vw * 4 );
+			}
+		}
+	}
+
+	if ( simpleAlpha && sa )
+		*simpleAlpha = 1;
+	if ( complexAlpha && ca )
+		*complexAlpha = 1;
+}
+
+#endif /* ARMOPT_NEON64 */
+
+void DecompressImageDXT1( uint32_t width, uint32_t height, const uint8_t* blocks,
+	int transparent0, int* simpleAlpha, int* complexAlpha,
+	uint32_t* rgba )
+{
+	if ( !blocks || !rgba || !width || !height )
+		return;
+#if ARMOPT_NEON64
+	DxtImage_Neon( 1, width, height, blocks, transparent0, simpleAlpha, complexAlpha, rgba );
+#else
+	DxtImage_Scalar( DxtBlock1Rgba_Scalar, 8, width, height, blocks, transparent0, simpleAlpha, complexAlpha, rgba );
+#endif
+}
+
+void DecompressImageDXT3( uint32_t width, uint32_t height, const uint8_t* blocks,
+	int transparent0, int* simpleAlpha, int* complexAlpha,
+	uint32_t* rgba )
+{
+	if ( !blocks || !rgba || !width || !height )
+		return;
+#if ARMOPT_NEON64
+	DxtImage_Neon( 3, width, height, blocks, transparent0, simpleAlpha, complexAlpha, rgba );
+#else
+	DxtImage_Scalar( DecompressBlockDXT3_Scalar, 16, width, height, blocks, transparent0, simpleAlpha, complexAlpha, rgba );
+#endif
+}
+
+void DecompressImageDXT5( uint32_t width, uint32_t height, const uint8_t* blocks,
+	int transparent0, int* simpleAlpha, int* complexAlpha,
+	uint32_t* rgba )
+{
+	if ( !blocks || !rgba || !width || !height )
+		return;
+	(void)transparent0;		/* DXT5 ignores it */
+#if ARMOPT_NEON64
+	DxtImage_Neon( 5, width, height, blocks, 0, simpleAlpha, complexAlpha, rgba );
+#else
+	DxtImage_Scalar( DecompressBlockDXT5_Scalar, 16, width, height, blocks, 0, simpleAlpha, complexAlpha, rgba );
 #endif
 }
