@@ -1,4 +1,4 @@
-//========= ASTC runtime recompression (added on top of Valve TOGL) - v5 =======//
+//========= ASTC runtime recompression (added on top of Valve TOGL) - v6 =======//
 //
 // astc_texcompress.cpp
 //
@@ -19,6 +19,7 @@
 //===============================================================================
 
 #include "astc_texcompress.h"
+#include "arm_neon_opt.h"	// AArch64 NEON texel conversion kernels (scalar fallback below)
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -37,6 +38,7 @@
 	#include <set>
 	#include <map>
 	#include <string>
+	#include <memory>
 	#include <cstdint>
 	#ifdef _WIN32
 		#include <direct.h>
@@ -163,7 +165,13 @@ ConVar gl_astc_block_hdr( "gl_astc_block_hdr", "4x4", FCVAR_ARCHIVE,
 	"ASTC block footprint for half/float (HDR) sources. Invalid values fall back to 4x4." );
 
 ConVar gl_astc_quality( "gl_astc_quality", "60", FCVAR_ARCHIVE,
-	"ASTC encoder effort, 0 (fastest) - 100 (exhaustive). Higher is slower on first encode; the disk cache removes that cost after the first launch." );
+	"ASTC encoder effort, 0 (fastest) - 100 (exhaustive), handed to astcenc as is: 0 = fastest, 10 = fast, 60 = medium (default), 98 = thorough, 100 = exhaustive, "
+	"and every value in between is its own speed / quality point (it used to snap to those five presets). Higher is slower on first encode; the cache removes that cost the next time the same texture is needed." );
+
+ConVar gl_astc_dxt_mode_limit( "gl_astc_dxt_mode_limit", "50", FCVAR_ARCHIVE,
+	"Encoder speed-up for levels that come from DXT textures. DXT is already lossy, so the encoder's finest search buys little there: this caps the share of ASTC block modes it tries, in percent. "
+	"50 (default) encodes DXT levels about 1.5-1.8x faster for roughly 0.15-0.2 dB lower PSNR. Lower = faster and coarser, 0 or 100 = off (full preset quality for DXT as well). "
+	"Used for block sizes of 25 texels or more (5x5 and up), never for 4x4 / 5x4 blocks, HDR, or textures that are not DXT. Applied when the encoder context is first created; changing it later starts a second context." );
 
 ConVar gl_astc_threads( "gl_astc_threads", "0", FCVAR_ARCHIVE,
 	"Encoder worker threads. 0 = auto = every CPU core of the device. 1 = single threaded. Applied at first use; restart to change." );
@@ -172,7 +180,7 @@ ConVar gl_astc_cache( "gl_astc_cache", "1", FCVAR_ARCHIVE,
 	"1 = keep encoded ASTC blocks in a dynamic RAM cache, keyed by source pixels and encode parameters, so the same texture level is never encoded twice in one session. "
 	"Nothing is written to storage unless gl_astc_disk_cache is also 1." );
 
-ConVar gl_astc_disk_cache( "gl_astc_disk_cache", "1", FCVAR_ARCHIVE,
+ConVar gl_astc_disk_cache( "gl_astc_disk_cache", "0", FCVAR_ARCHIVE,
 	"0 (default) = ASTC textures live in RAM only, nothing is saved to storage; every launch encodes again. "
 	"1 = also keep a persistent second tier in the single file astc_cache/astc_cache.bin (much faster launches, uses storage). Applied at first use." );
 
@@ -202,7 +210,8 @@ ConVar gl_astc_perceptual( "gl_astc_perceptual", "1", FCVAR_ARCHIVE,
 
 ConVar gl_astc_debug( "gl_astc_debug", "1", FCVAR_ARCHIVE,
 	"0 = off. 1 = check glGetError after the first ASTC level uploads and log failures to the engine log. "
-	"2 = check after every upload and also log every upload." );
+	"2 = check after every upload and also log every upload. "
+	"3 = additionally log what every level is encoded from, and for every encode / cache hit its size, block size, time and encoder block-mode cap." );
 
 // ---------------------------------------------------------------------------
 // Format classification
@@ -394,10 +403,33 @@ static inline void MapChannels( ChanLayout lay, const V* c, V one, V* r, V* g, V
 	}
 }
 
+// AArch64: widens 8-bit sources to RGBA8 16 pixels at a time (ld2/ld3/ld4 + st4). Returns how many pixels were
+// converted (a multiple of 16, 0 when the NEON path is not compiled in); the scalar loop does the rest.
+static size_t ConvertPlanarU8Neon( const uint8_t* src, size_t n, ChanLayout lay, bool forceOpaque, uint8_t* dst )
+{
+	int l;
+	switch ( lay )
+	{
+		case kLay_RGBA: l = ARMOPT_LAY_RGBA; break;
+		case kLay_BGRA: l = ARMOPT_LAY_BGRA; break;
+		case kLay_RGB:  l = ARMOPT_LAY_RGB;  break;
+		case kLay_BGR:  l = ARMOPT_LAY_BGR;  break;
+		case kLay_RG:   l = ARMOPT_LAY_RG;   break;
+		case kLay_R:    l = ARMOPT_LAY_R;    break;
+		case kLay_L:    l = ARMOPT_LAY_L;    break;
+		case kLay_LA:   l = ARMOPT_LAY_LA;   break;
+		case kLay_A:    l = ARMOPT_LAY_A;    break;
+		default:        return 0;
+	}
+	return ArmOpt_U8ToRGBA( src, n, l, forceOpaque ? 1 : 0, dst );
+}
+
 template< typename T >
 static void ConvertPlanarUNorm( const uint8_t* src, size_t n, ChanLayout lay, int comps, bool forceOpaque, uint8_t* dst )
 {
-	for ( size_t i = 0; i < n; ++i )
+	const size_t first = ( sizeof( T ) == 1 ) ? ConvertPlanarU8Neon( src, n, lay, forceOpaque, dst ) : 0;
+
+	for ( size_t i = first; i < n; ++i )
 	{
 		uint8_t c[4] = { 0, 0, 0, 0 };
 		for ( int k = 0; k < comps; ++k )
@@ -566,7 +598,17 @@ static float* ConvertToRGBAF32( const void* srcData, size_t n, unsigned int glFo
 
 	if ( lay != kLay_Invalid && ( isHalf || isFloat ) )
 	{
-		for ( size_t i = 0; i < n; ++i )
+		// AArch64: RGBA / BGRA half and float sources are widened and sanitised with NEON (vcvt + clamp);
+		// the scalar loop below finishes the remainder (and does everything on other CPUs).
+		size_t first = 0;
+		if ( comps == 4 )
+		{
+			const int bgra = ( lay == kLay_BGRA ) ? 1 : 0;
+			first = isHalf ? ArmOpt_HalfRGBAToF32( src, n, bgra, forceOpaque ? 1 : 0, dst )
+						   : ArmOpt_F32RGBAToF32( src, n, bgra, forceOpaque ? 1 : 0, dst );
+		}
+
+		for ( size_t i = first; i < n; ++i )
 		{
 			float c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 			for ( int k = 0; k < comps; ++k )
@@ -625,13 +667,68 @@ static size_t SrcTexelBytes( unsigned int fmt, unsigned int type )
 
 static const uint32_t kCacheVersion = 3;
 
-static float QualityFromPreset( int qualityPreset )
+// gl_astc_quality goes to astcenc as is: astcenc interpolates its tuning tables between the named presets
+// (0 fastest, 10 fast, 60 medium, 98 thorough, 100 exhaustive), so every value is a distinct speed / quality point.
+// It used to snap to those five presets, which made 11..35 one encode and 36..65 another.
+static float QualityToAstc( int q )
 {
-	if ( qualityPreset <= 10 )		return ASTCENC_PRE_FASTEST;
-	else if ( qualityPreset <= 35 )	return ASTCENC_PRE_FAST;
-	else if ( qualityPreset <= 65 )	return ASTCENC_PRE_MEDIUM;
-	else if ( qualityPreset <= 90 )	return ASTCENC_PRE_THOROUGH;
-	return ASTCENC_PRE_EXHAUSTIVE;
+	if ( q < 0 )
+		q = 0;
+	if ( q > 100 )
+		q = 100;
+	return (float)q;
+}
+
+// The cache keys carry the quality value. The old snapping and the exact mapping give the same encode at 0, 60 (the
+// default) and 100, so those keep the cache entries that already exist; every other value gets keys of its own.
+static uint32_t QualityKeyValue( int q )
+{
+	if ( q < 0 )
+		q = 0;
+	if ( q > 100 )
+		q = 100;
+	return ( q == 0 || q == 60 || q == 100 ) ? (uint32_t)q : ( (uint32_t)q | 0x10000u );
+}
+
+// Cap on the share of ASTC block modes the encoder tries for levels decoded from DXT (gl_astc_dxt_mode_limit), 0 = use the
+// preset's own value. Blocks below 25 texels (4x4, 5x4) use a different tuning row and lose far more quality for the time
+// they save, HDR is never DXT, so both are left alone.
+static uint32_t DxtModeLimit( bool isHDR, int blockW, int blockH )
+{
+	if ( isHDR || blockW * blockH < 25 )
+		return 0;
+	const int v = gl_astc_dxt_mode_limit.GetInt();
+	return ( v >= 1 && v <= 99 ) ? (uint32_t)v : 0;
+}
+
+// astcenc_config::tune_block_mode_limit (percentage of the block modes the compressor may use) exists in every astcenc
+// 3.x / 4.x. The overloads keep this file building against a header that does not have the member (the cap is then
+// simply not applied). Only ever lowers the preset's value.
+template< typename C >
+static auto SetBlockModeLimit( C& c, unsigned v, int ) -> decltype( (void)c.tune_block_mode_limit, void() )
+{
+	if ( c.tune_block_mode_limit > v )
+		c.tune_block_mode_limit = v;
+}
+
+template< typename C >
+static void SetBlockModeLimit( C&, unsigned, long )
+{
+}
+
+// astcenc_context_alloc() takes three parameters in astcenc 3.x / 4.x and a fourth one (the parent context, NULL here)
+// from 5.x on. The overloads call whichever one the header declares.
+template< typename Cfg >
+static auto ContextAlloc( const Cfg* config, unsigned threads, astcenc_context** ctx, int )
+	-> decltype( astcenc_context_alloc( config, threads, ctx ) )
+{
+	return astcenc_context_alloc( config, threads, ctx );
+}
+
+template< typename Cfg >
+static astcenc_error ContextAlloc( const Cfg* config, unsigned threads, astcenc_context** ctx, long )
+{
+	return astcenc_context_alloc( config, threads, ctx, NULL );
 }
 
 // ---- fast 64-bit hash (xxHash64 algorithm) ---------------------------------
@@ -728,6 +825,8 @@ struct AstcStats
 	std::atomic<uint64_t> poolThreads;
 	std::atomic<uint64_t> ramHits;
 	std::atomic<uint64_t> diskHits;
+	std::atomic<uint64_t> hitMicros;		// time spent in cache lookups that hit (RAM or file)
+	std::atomic<uint64_t> hitBytes;			// bytes those hits delivered
 };
 static AstcStats s_stats;
 
@@ -927,14 +1026,26 @@ struct SharedCtx
 	int				blockW, blockH;
 	int				qualityKey;		// quality * 1000, integer for exact matching
 	uint32_t		flags;
-	astcenc_context* ctx;
+	uint32_t		modeLimit;		// block-mode cap in percent for DXT-sourced levels, 0 = the preset's own value
+	astcenc_context* ctx;			// NULL = building it failed for a reason that will not change; remembered so it is not retried (and logged) for every texture
 };
+
+// The shared contexts are only ever used to COMPRESS (astcenc_decompress_image is never called), so they can be
+// created with ASTCENC_FLG_SELF_DECOMPRESS_ONLY (bit 5 in every astcenc release that has it): astcenc then drops the
+// block modes and partitionings its own compressor never produces. That means smaller lookup tables, a faster context
+// build and fewer cache misses while encoding, with the same encoder behaviour. An astcenc build that does not know
+// the flag rejects it and the plain flags are used instead. The cache key flags ('flags') are intentionally unchanged.
+#if defined( ASTCENC_FLG_SELF_DECOMPRESS_ONLY )
+static const uint32_t kAstcSelfDecompressOnly = ASTCENC_FLG_SELF_DECOMPRESS_ONLY;
+#else
+static const uint32_t kAstcSelfDecompressOnly = 1u << 5;
+#endif
 
 static std::mutex				s_ctxMutex;
 static std::vector<SharedCtx>	s_ctxs;
 static std::mutex				s_encodeMutex;	// an astcenc context must not be used by two calls at once
 
-static astcenc_context* AcquireSharedContext( astcenc_profile profile, int bw, int bh, float quality, uint32_t flags )
+static astcenc_context* AcquireSharedContext( astcenc_profile profile, int bw, int bh, float quality, uint32_t flags, uint32_t modeLimit )
 {
 	const unsigned threads = GetPool()->Size();
 
@@ -944,43 +1055,67 @@ static astcenc_context* AcquireSharedContext( astcenc_profile profile, int bw, i
 	for ( size_t i = 0; i < s_ctxs.size(); ++i )
 	{
 		const SharedCtx& c = s_ctxs[i];
-		if ( c.profile == profile && c.blockW == bw && c.blockH == bh && c.qualityKey == qKey && c.flags == flags )
+		if ( c.profile == profile && c.blockW == bw && c.blockH == bh && c.qualityKey == qKey && c.flags == flags && c.modeLimit == modeLimit )
 			return c.ctx;
 	}
 
 	astcenc_config config;
-	astcenc_error status = astcenc_config_init( profile, bw, bh, 1, quality, flags, &config );
+	bool selfDecompress = true;
+	astcenc_error status = astcenc_config_init( profile, bw, bh, 1, quality, flags | kAstcSelfDecompressOnly, &config );
 	if ( status != ASTCENC_SUCCESS )
 	{
-		Warning( "ASTC: astcenc_config_init(%dx%d) failed: %s\n", bw, bh, astcenc_get_error_string( status ) );
-		return NULL;
+		selfDecompress = false;
+		status = astcenc_config_init( profile, bw, bh, 1, quality, flags, &config );	// astcenc without that flag
 	}
 
 	astcenc_context* ctx = NULL;
-	status = astcenc_context_alloc( &config, threads, &ctx );
 	if ( status != ASTCENC_SUCCESS )
 	{
-		Warning( "ASTC: astcenc_context_alloc failed: %s\n", astcenc_get_error_string( status ) );
-		return NULL;
+		Warning( "ASTC: astcenc_config_init(%dx%d) failed: %s\n", bw, bh, astcenc_get_error_string( status ) );
+	}
+	else
+	{
+		// The block-mode cap only takes effect when the context drops the modes the compressor will not use, which is what
+		// SELF_DECOMPRESS_ONLY does at context creation.
+		if ( modeLimit && selfDecompress )
+			SetBlockModeLimit( config, modeLimit, 0 );
+
+		status = ContextAlloc( &config, threads, &ctx, 0 );
+		if ( status != ASTCENC_SUCCESS )
+		{
+			Warning( "ASTC: astcenc_context_alloc failed: %s\n", astcenc_get_error_string( status ) );
+			ctx = NULL;
+			if ( status == ASTCENC_ERR_OUT_OF_MEM )
+				return NULL;	// memory may be free again for the next texture: this failure is not remembered
+		}
 	}
 
-	SharedCtx entry = { profile, bw, bh, qKey, flags, ctx };
+	// A failure that cannot change (bad block size, unsupported profile, ...) is remembered as an entry without a context.
+	SharedCtx entry = { profile, bw, bh, qKey, flags, modeLimit, ctx };
 	s_ctxs.push_back( entry );
-	Msg( "ASTC: encoder context #%d ready (profile %d, block %dx%d, quality %.0f, flags 0x%X, %u thread slot(s))\n",
-		 (int)s_ctxs.size(), (int)profile, bw, bh, quality, (unsigned)flags, threads );
+	if ( ctx )
+	{
+		char cap[24];
+		if ( modeLimit && selfDecompress )
+			snprintf( cap, sizeof( cap ), "capped at %u%%", (unsigned)modeLimit );
+		else
+			snprintf( cap, sizeof( cap ), "preset" );
+		Msg( "ASTC: encoder context #%d ready (profile %d, block %dx%d, quality %.1f, flags 0x%X, block modes: %s, %u thread slot(s))\n",
+			 (int)s_ctxs.size(), (int)profile, bw, bh, quality, (unsigned)flags, cap, threads );
+	}
 	return ctx;
 }
 
 // About how many ASTC blocks one thread should get before waking it pays off.
 static const size_t kBlocksPerThread = 24;
 
-static astcenc_error EncodeImage( astcenc_profile profile, int bw, int bh, float quality, uint32_t flags,
+static astcenc_error EncodeImage( astcenc_profile profile, int bw, int bh, float quality, uint32_t flags, uint32_t modeLimit,
 								  astcenc_image& image, const astcenc_swizzle& swz,
 								  uint8_t* out, size_t outSize, size_t blockCount )
 {
 	EncodePool* pool = GetPool();
 
-	astcenc_context* ctx = AcquireSharedContext( profile, bw, bh, quality, flags );
+	astcenc_context* ctx = AcquireSharedContext( profile, bw, bh, quality, flags, modeLimit );
 	if ( !ctx )
 		return ASTCENC_ERR_BAD_PARAM;
 
@@ -1197,7 +1332,14 @@ public:
 
 	void Put( uint64_t key, const uint8_t* data, size_t size, size_t budget )
 	{
-		if ( budget == 0 || size == 0 || size > kRamEntryMax || size > budget )
+		if ( budget == 0 )
+		{
+			// The tier is switched off, or the device ran low on memory: give back what is held. (Without this the
+			// entries stayed until the process ended, whatever the budget said.)
+			Trim( 0 );
+			return;
+		}
+		if ( size == 0 || size > kRamEntryMax || size > budget )
 			return;
 
 		std::lock_guard<std::mutex> lk( m_mtx );
@@ -1387,6 +1529,67 @@ static bool PWriteFull( int fd, const void* buf, size_t n, uint64_t off )
 	return true;
 }
 
+// Reads up to n bytes at 'off'; returns how many it got (fewer than n at the end of the file or on an error).
+static size_t PReadSome( int fd, void* buf, size_t n, uint64_t off )
+{
+	uint8_t* p = (uint8_t*)buf;
+	size_t got = 0;
+	while ( got < n )
+	{
+		const ssize_t r = pread( fd, p + got, n - got, (off_t)( off + got ) );
+		if ( r < 0 )
+		{
+			if ( errno == EINTR )
+				continue;
+			break;
+		}
+		if ( r == 0 )
+			break;
+		got += (size_t)r;
+	}
+	return got;
+}
+
+// Reads the whole slot table with one request (the kernel splits it as it likes) instead of eight 1 MB reads over a
+// table that was zero-filled twice first, and counts the used slots on the way. A short file leaves the rest empty.
+static uint32_t LoadSlotTable( int fd, PackSlot* slots, uint64_t tableOffset )
+{
+	const size_t total = (size_t)kPackSlotCount * sizeof( PackSlot );
+	const size_t got = PReadSome( fd, slots, total, tableOffset );
+	if ( got < total )
+		memset( (uint8_t*)slots + got, 0, total - got );
+
+	uint32_t count = 0;
+	for ( uint32_t i = 0; i < kPackSlotCount; ++i )
+		count += ( slots[i].key != 0 ) ? 1u : 0u;
+	return count;
+}
+
+// Reads one record (header + payload) into dst and verifies it. The header and the first 16 KB of payload come in with
+// ONE pread() into a stack buffer: most levels are smaller than that (mip tails, small textures), so a file hit costs
+// a single system call instead of two. Bigger payloads read only the rest of the payload with a second call.
+static bool ReadPackRecord( int fd, uint64_t off, uint64_t key, uint8_t* dst, size_t size )
+{
+	uint8_t first[16384];
+	const size_t want = sizeof( PackRec ) + size;
+	const size_t n1 = want < sizeof( first ) ? want : sizeof( first );
+
+	if ( !PReadFull( fd, first, n1, off ) )
+		return false;
+
+	PackRec rec;
+	memcpy( &rec, first, sizeof( rec ) );
+	if ( rec.magic != kRecMagic || rec.key != key || rec.size != size )
+		return false;
+
+	const size_t inFirst = n1 - sizeof( rec );		// payload bytes that came with the header
+	memcpy( dst, first + sizeof( rec ), inFirst );
+	if ( inFirst < size && !PReadFull( fd, dst + inFirst, size - inFirst, off + n1 ) )
+		return false;
+
+	return Hash64( dst, size, kPayloadSeed ) == rec.hash;
+}
+
 static uint32_t PackHome( uint64_t key )
 {
 	return (uint32_t)( ( key * 0x9E3779B97F4A7C15ULL ) >> ( 64 - kPackSlotBits ) );
@@ -1515,6 +1718,7 @@ private:
 
 	bool Open();
 	bool FindMem( uint64_t key, PackSlot* out, uint32_t* outIdx );		// caller holds m_mtx
+	bool FindHot( uint64_t key, PackSlot* out, uint8_t* outHot );		// FindMem + read counter, takes m_mtx
 	bool ReloadTable();
 	AppendResult AppendLocked( uint64_t key, const uint8_t* data, size_t size, PackSlot* outSlot, uint32_t* outIdx, uint64_t* outEnd, uint64_t* outEndBefore );
 	bool ResetLocked();
@@ -1523,7 +1727,7 @@ private:
 	std::atomic<int>		m_state;		// 0 = not tried yet, 1 = ready, -1 = unavailable
 	std::mutex				m_mtx;			// guards m_slots, m_hot, m_count, m_syncedSize
 	std::mutex				m_ioMtx;		// serializes this copy's file writes; flock() covers other copies
-	std::vector<PackSlot>	m_slots;
+	std::unique_ptr<PackSlot[]>	m_slots;	// the whole slot table, read from the file in one piece
 	std::vector<uint8_t>	m_hot;			// per slot: how many times it was read from the file
 	uint32_t				m_count;
 	uint64_t				m_syncedSize;	// file size our in-memory table is known to match
@@ -1597,28 +1801,10 @@ bool AstcPack::Open()
 
 	flock( fd, LOCK_UN );
 
-	m_slots.assign( kPackSlotCount, PackSlot() );
-	memset( &m_slots[0], 0, (size_t)kPackSlotCount * sizeof( PackSlot ) );
+	m_slots.reset( new PackSlot[kPackSlotCount] );		// not zeroed here: the file is read over it, LoadSlotTable() clears what it does not cover
 	m_hot.assign( kPackSlotCount, 0 );
 
-	// load the table in 1 MB pieces; a short file just leaves the rest empty
-	const size_t total = (size_t)kPackSlotCount * sizeof( PackSlot );
-	uint8_t* tbl = (uint8_t*)&m_slots[0];
-	size_t done = 0;
-	while ( done < total )
-	{
-		const size_t chunk = total - done > ( 1u << 20 ) ? ( 1u << 20 ) : total - done;
-		if ( !PReadFull( fd, tbl + done, chunk, tableOffset + done ) )
-			break;
-		done += chunk;
-	}
-
-	uint32_t count = 0;
-	for ( uint32_t i = 0; i < kPackSlotCount; ++i )
-	{
-		if ( m_slots[i].key )
-			++count;
-	}
+	const uint32_t count = LoadSlotTable( fd, m_slots.get(), tableOffset );
 	m_count = count;
 
 	struct stat st2;
@@ -1669,28 +1855,21 @@ bool AstcPack::ReloadTable()
 	if ( fstat( m_fd, &st ) != 0 )
 		return false;
 
-	const size_t total = (size_t)kPackSlotCount * sizeof( PackSlot );
-	uint8_t* tbl = (uint8_t*)&m_slots[0];
-	size_t done = 0;
-	while ( done < total )
-	{
-		const size_t chunk = total - done > ( 1u << 20 ) ? ( 1u << 20 ) : total - done;
-		if ( !PReadFull( m_fd, tbl + done, chunk, kPackHeaderBytes + done ) )
-		{
-			memset( tbl + done, 0, total - done );
-			break;
-		}
-		done += chunk;
-	}
-
-	uint32_t count = 0;
-	for ( uint32_t i = 0; i < kPackSlotCount; ++i )
-	{
-		if ( m_slots[i].key )
-			++count;
-	}
-	m_count = count;
+	m_count = LoadSlotTable( m_fd, m_slots.get(), kPackHeaderBytes );
 	m_syncedSize = (uint64_t)st.st_size;
+	return true;
+}
+
+// FindMem() plus the per-slot read counter that decides when a level is promoted to the RAM tier.
+bool AstcPack::FindHot( uint64_t key, PackSlot* out, uint8_t* outHot )
+{
+	std::lock_guard<std::mutex> lk( m_mtx );
+	uint32_t idx = 0;
+	if ( !FindMem( key, out, &idx ) )
+		return false;
+	if ( m_hot[idx] < 255 )
+		++m_hot[idx];
+	*outHot = m_hot[idx];
 	return true;
 }
 
@@ -1710,12 +1889,8 @@ bool AstcPack::Lookup( uint64_t key, uint8_t* dst, size_t size )
 		return false;
 
 	PackSlot slot;
-	uint32_t idx = 0;
-	bool found;
-	{
-		std::lock_guard<std::mutex> lk( m_mtx );
-		found = FindMem( key, &slot, &idx );
-	}
+	uint8_t hot = 0;
+	bool found = FindHot( key, &slot, &hot );
 
 	if ( !found )
 	{
@@ -1733,10 +1908,7 @@ bool AstcPack::Lookup( uint64_t key, uint8_t* dst, size_t size )
 			{
 				m_lastReloadMs.store( now );
 				if ( ReloadTable() )
-				{
-					std::lock_guard<std::mutex> lk( m_mtx );
-					found = FindMem( key, &slot, &idx );
-				}
+					found = FindHot( key, &slot, &hot );
 			}
 		}
 	}
@@ -1744,27 +1916,12 @@ bool AstcPack::Lookup( uint64_t key, uint8_t* dst, size_t size )
 	if ( !found || slot.size != size )
 		return false;
 
-	PackRec rec;
-	const uint64_t off = (uint64_t)slot.off16 * 16ull;
-	if ( !PReadFull( m_fd, &rec, sizeof( rec ), off ) )
-		return false;
-	if ( rec.magic != kRecMagic || rec.key != key || rec.size != size )
-		return false;
-	if ( !PReadFull( m_fd, dst, size, off + sizeof( rec ) ) )
-		return false;
-	if ( Hash64( dst, size, kPayloadSeed ) != rec.hash )
+	if ( !ReadPackRecord( m_fd, (uint64_t)slot.off16 * 16ull, key, dst, size ) )
 		return false;
 
 	s_stats.diskHits.fetch_add( 1 );
 
 	// Tier 2 -> 1: promote what keeps getting reused (and anything tiny) into RAM.
-	uint8_t hot;
-	{
-		std::lock_guard<std::mutex> lk( m_mtx );
-		if ( m_hot[idx] < 255 )
-			++m_hot[idx];
-		hot = m_hot[idx];
-	}
 	if ( size <= kRamTinyBytes || hot >= 2 )
 		s_ram.Put( key, dst, size, RamBudgetBytes() );
 
@@ -1785,6 +1942,14 @@ AstcPack::AppendResult AstcPack::AppendLocked( uint64_t key, const uint8_t* data
 
 	if ( recOff + sizeof( PackRec ) + size > m_maxBytes || recOff / 16ull > 0xFFFFFFF0ull )
 		return kFull;
+
+	{
+		// kPackMaxEntries was declared but never enforced: past ~70% load the probe chains of the open-addressing table
+		// get long. Treat that like a full file (the hot entries are carried over by the reset).
+		std::lock_guard<std::mutex> lk( m_mtx );
+		if ( m_count >= kPackMaxEntries )
+			return kFull;
+	}
 
 	// find the slot in the FILE's table: another copy may have filled slots we don't know about yet
 	const uint32_t mask = kPackSlotCount - 1;
@@ -1988,11 +2153,19 @@ static AstcPack* GetPack()
 
 static bool CacheLoad( uint64_t key, uint8_t* dst, size_t dstSize )
 {
+	const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 	const bool hit = GetPack()->Lookup( key, dst, dstSize );
 	if ( hit )
+	{
 		s_stats.hits.fetch_add( 1 );
+		s_stats.hitBytes.fetch_add( dstSize );
+		s_stats.hitMicros.fetch_add( (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - t0 ).count() );
+	}
 	else
+	{
 		s_stats.misses.fetch_add( 1 );
+	}
 	return hit;
 }
 
@@ -2023,9 +2196,13 @@ static void ReportStats( bool force )
 
 	const double sec = (double)s_stats.encMicros.load() / 1.0e6;
 	const double mp = (double)s_stats.encPixels.load() / 1.0e6;
-	Msg( "ASTC stats: %llu levels encoded (%.1f MP) in %.1f s = %.2f MP/s on %u thread(s) | cache: %llu hits (%llu RAM, %llu file), %llu misses, %llu stored (%.1f MB), RAM tier %.1f MB\n",
+	const uint64_t hits = s_stats.hits.load();
+	const double hitSec = (double)s_stats.hitMicros.load() / 1.0e6;
+	const double hitMB = (double)s_stats.hitBytes.load() / ( 1024.0 * 1024.0 );
+	Msg( "ASTC stats: %llu levels encoded (%.1f MP) in %.1f s = %.2f MP/s on %u thread(s) | cache: %llu hits (%llu RAM, %llu file) read %.1f MB in %.2f s (%.0f us each), %llu misses, %llu stored (%.1f MB), RAM tier %.1f MB\n",
 		 (unsigned long long)s_stats.encImages.load(), mp, sec, sec > 0.0 ? mp / sec : 0.0, (unsigned)s_stats.poolThreads.load(),
-		 (unsigned long long)s_stats.hits.load(), (unsigned long long)s_stats.ramHits.load(), (unsigned long long)s_stats.diskHits.load(),
+		 (unsigned long long)hits, (unsigned long long)s_stats.ramHits.load(), (unsigned long long)s_stats.diskHits.load(),
+		 hitMB, hitSec, hits ? hitSec * 1.0e6 / (double)hits : 0.0,
 		 (unsigned long long)s_stats.misses.load(), (unsigned long long)s_stats.stores.load(),
 		 (double)s_stats.storedBytes.load() / ( 1024.0 * 1024.0 ), (double)s_ram.Bytes() / ( 1024.0 * 1024.0 ) );
 }
@@ -2048,7 +2225,8 @@ bool ASTC_CompressTexture(
 		int blockH,
 		int qualityPreset,
 		ASTCEncodeResult* outResult,
-		bool allowDiskCache )
+		bool allowDiskCache,
+		bool dxtSource )
 {
 	if ( outResult )
 		memset( outResult, 0, sizeof( *outResult ) );
@@ -2056,7 +2234,7 @@ bool ASTC_CompressTexture(
 #if !defined( HAVE_ASTCENC )
 	(void)srcData; (void)width; (void)height; (void)srcGLFormat; (void)srcGLType;
 	(void)isHDR; (void)isSRGB; (void)forceOpaque; (void)blockW; (void)blockH; (void)qualityPreset;
-	(void)allowDiskCache;
+	(void)allowDiskCache; (void)dxtSource;
 	return false;
 #else
 	if ( !srcData || width <= 0 || height <= 0 || !outResult || !ASTC_IsValidBlockSize( blockW, blockH ) )
@@ -2068,9 +2246,10 @@ bool ASTC_CompressTexture(
 	const size_t compSize = xBlocks * yBlocks * 16;	// every ASTC block is 16 bytes
 
 	const astcenc_profile profile = isHDR ? ASTCENC_PRF_HDR : ( isSRGB ? ASTCENC_PRF_LDR_SRGB : ASTCENC_PRF_LDR );
-	const float quality = QualityFromPreset( qualityPreset );
+	const float quality = QualityToAstc( qualityPreset );
 
 	const uint32_t flags = ComputeEncodeFlags( isHDR, forceOpaque );
+	const uint32_t modeLimit = dxtSource ? DxtModeLimit( isHDR, blockW, blockH ) : 0;	// bits 16.. of the key's flags slot: a different encoder policy is a different entry
 
 	uint8_t* compData = (uint8_t*)malloc( compSize );
 	if ( !compData )
@@ -2086,7 +2265,7 @@ bool ASTC_CompressTexture(
 		const uint32_t params[12] = {
 			kCacheVersion, srcGLFormat, srcGLType, (uint32_t)width, (uint32_t)height,
 			isHDR, isSRGB, forceOpaque, (uint32_t)blockW, (uint32_t)blockH,
-			(uint32_t)qualityPreset, flags
+			QualityKeyValue( qualityPreset ), flags | ( modeLimit << 16 )
 		};
 		key = ComputeCacheKey( srcData, nPixels * SrcTexelBytes( srcGLFormat, srcGLType ), params );
 
@@ -2098,6 +2277,8 @@ bool ASTC_CompressTexture(
 			outResult->m_blockW = blockW;
 			outResult->m_blockH = blockH;
 			outResult->m_profile = isHDR ? kASTCProfile_HDR : kASTCProfile_LDR;
+			if ( gl_astc_debug.GetInt() >= 3 )
+				Msg( "ASTC: %dx%d %s block %dx%d: cache hit\n", width, height, isHDR ? "HDR" : "LDR", blockW, blockH );
 			ReportStats( false );
 			return true;
 		}
@@ -2121,8 +2302,10 @@ bool ASTC_CompressTexture(
 	image.data_type = plan.isFloat ? ASTCENC_TYPE_F32 : ASTCENC_TYPE_U8;
 	image.data = sliceArray;
 
-	astcenc_error status = EncodeImage( profile, blockW, blockH, quality, flags, image, plan.swz,
+	const int64_t encT0 = NowMs();
+	astcenc_error status = EncodeImage( profile, blockW, blockH, quality, flags, modeLimit, image, plan.swz,
 										compData, compSize, xBlocks * yBlocks );
+	const int64_t encMs = NowMs() - encT0;
 
 	free( plan.owned );
 
@@ -2131,6 +2314,18 @@ bool ASTC_CompressTexture(
 		Warning( "ASTC: astcenc_compress_image failed: %s\n", astcenc_get_error_string( status ) );
 		free( compData );
 		return false;
+	}
+
+	if ( gl_astc_debug.GetInt() >= 3 )
+	{
+		char cap[16];
+		if ( modeLimit )
+			snprintf( cap, sizeof( cap ), "%u%%", (unsigned)modeLimit );
+		else
+			snprintf( cap, sizeof( cap ), "preset" );
+		Msg( "ASTC: %dx%d %s block %dx%d: encoded in %lld ms (%.2f MP/s), quality %.1f, block modes %s, %s\n",
+			 width, height, isHDR ? "HDR" : "LDR", blockW, blockH, (long long)encMs,
+			 encMs > 0 ? (double)nPixels / 1000.0 / (double)encMs : 0.0, quality, cap, dxtSource ? "DXT source" : "pixel source" );
 	}
 
 	if ( useCache )
@@ -2172,7 +2367,8 @@ void ASTC_CompressTextureRequired(
 		unsigned int srcGLType,
 		ASTCEncodeResult* outResult,
 		bool allowDiskCache,
-		bool* outFallback )
+		bool* outFallback,
+		bool dxtSource )
 {
 	if ( outResult )
 		memset( outResult, 0, sizeof( *outResult ) );
@@ -2184,7 +2380,7 @@ void ASTC_CompressTextureRequired(
 
 	if ( ASTC_CompressTexture( srcData, width, height, srcGLFormat, srcGLType,
 							   isHDR, isSRGB, forceOpaque, blockW, blockH, gl_astc_quality.GetInt(),
-							   outResult, allowDiskCache ) )
+							   outResult, allowDiskCache, dxtSource ) )
 		return;
 
 	// v3: this used to be Error(), which killed the whole game on the first texture the encoder
@@ -2272,10 +2468,11 @@ uint64_t ASTC_ExternalCacheKey( const void* srcBytes, size_t srcLen, unsigned in
 	ASTC_GetConfiguredBlockSize( isHDR, &blockW, &blockH );
 
 	const uint32_t flags = ComputeEncodeFlags( isHDR, forceOpaque );
+	const uint32_t modeLimit = DxtModeLimit( isHDR, blockW, blockH );	// external keys are DXT sources, which the encoder handles with the DXT policy
 	const uint32_t params[12] = {
 		kCacheVersion, srcFormatId, 0xE57C0DE5u /* external-source marker */, (uint32_t)width, (uint32_t)height,
 		isHDR, isSRGB, forceOpaque, (uint32_t)blockW, (uint32_t)blockH,
-		(uint32_t)gl_astc_quality.GetInt(), flags
+		QualityKeyValue( gl_astc_quality.GetInt() ), flags | ( modeLimit << 16 )
 	};
 	return ComputeCacheKey( srcBytes, srcLen, params );
 }
@@ -2296,6 +2493,11 @@ bool ASTC_CacheLookup( uint64_t key, int width, int height, bool isHDR, bool isS
 	const size_t yBlocks = ( (size_t)height + blockH - 1 ) / blockH;
 	const size_t compSize = xBlocks * yBlocks * 16;
 
+	// A level the RAM tier refuses to hold, with no file tier behind it, can never be in the cache: skip the
+	// allocation and the lookup (the same test ASTC_CompressTexture() applies).
+	if ( compSize > kRamEntryMax && !GetPack()->Ready() )
+		return false;
+
 	uint8_t* compData = (uint8_t*)malloc( compSize );
 	if ( !compData )
 		return false;
@@ -2305,6 +2507,9 @@ bool ASTC_CacheLookup( uint64_t key, int width, int height, bool isHDR, bool isS
 		free( compData );
 		return false;
 	}
+
+	if ( gl_astc_debug.GetInt() >= 3 )
+		Msg( "ASTC: %dx%d %s block %dx%d: cache hit (DXT source)\n", width, height, isHDR ? "HDR" : "LDR", blockW, blockH );
 
 	outResult->m_pData = compData;
 	outResult->m_nDataSize = (uint32_t)compSize;
