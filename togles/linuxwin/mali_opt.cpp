@@ -11,9 +11,15 @@
 //   3. glInvalidateFramebuffer wrapper (skip tile write-back of dead depth/stencil)
 //   4. occlusion query target selection
 //   5. program binary cache (single append-only file, in-memory open-addressing index)
+//   6. hitch profiler (which Togles step made a frame long) and its log lines
+//   7. uniform array locations: the vc[] / pc[] element locations of a linked pair without one driver call per element
+//   8. lazy shader translation: helpers (byte code size, switches); the translation itself is in dxabstract.cpp
+//   9. ASTC decode mode RGBA8 (GL_EXT_texture_compression_astc_decode_mode)
 //
 // Command line / environment switches added here:
 //   -gl_allow_adreno  or  TOGL_ALLOW_ADRENO=1    run on an Adreno GPU anyway (unsupported, for testing)
+//   -gl_no_lazy_xlat                              translate every shader when the engine creates it (the old behaviour)
+//   -gl_no_prof                                   hitch profiler off
 //
 // NOTE: no std::unordered_map / std::mutex here on purpose. The NDK r10e libc++ headers used by this project
 // do not compile some of them (see the note in astc_texcompress.cpp); plain C structures and pthreads are used.
@@ -28,6 +34,7 @@
 #include "tier0/icommandline.h"
 #include "tier1/convar.h"
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +74,22 @@ ConVar gl_mali_progcache_dir( "gl_mali_progcache_dir", "shader_cache", FCVAR_ARC
 	"Directory of the program binary cache file (progcache.bin), relative to the game's working directory. Safe to delete at any time." );
 ConVar gl_mali_progcache_max_mb( "gl_mali_progcache_max_mb", "256", FCVAR_ARCHIVE,
 	"Size limit of progcache.bin in MB. When it is full nothing more is added (delete the file to start over)." );
+ConVar gl_mali_lazy_xlat( "gl_mali_lazy_xlat", "1", FCVAR_ARCHIVE,
+	"Mali: translate a Direct3D shader to GLSL the first time a draw needs it, not when the engine creates it (the engine creates all dynamic combos of a shader at once - dozens to hundreds - and a draw uses one or two). Read at first use; -gl_no_lazy_xlat on the command line is more reliable." );
+ConVar gl_mali_uniform_fastpath( "gl_mali_uniform_fastpath", "1", FCVAR_ARCHIVE,
+	"Mali: take the locations of the vc[] / pc[] uniform array elements from the first one instead of asking the driver for every element (checked against the driver while the game runs, falls back by itself)." );
+ConVar gl_mali_uniform_verify( "gl_mali_uniform_verify", "0", 0,
+	"Debug: check the computed uniform array locations against the driver for every shader pair (slow)." );
+ConVar gl_mali_astc_decode_rgba8( "gl_mali_astc_decode_rgba8", "1", FCVAR_ARCHIVE,
+	"Mali: let the texture unit decode the ASTC textures to RGBA8 instead of fp16 (GL_EXT_texture_compression_astc_decode_mode). Applies to textures created after the change." );
+ConVar gl_mali_prof( "gl_mali_prof", "1", FCVAR_ARCHIVE,
+	"Hitch profiler: write frames that took much longer than the average to the log, with the Togles steps (shader translation, link, texture uploads ...) that caused them. 0 = off. -gl_no_prof on the command line also switches it off." );
+ConVar gl_mali_hitch_ms( "gl_mali_hitch_ms", "25", FCVAR_ARCHIVE,
+	"A frame is a hitch when it takes longer than this many milliseconds and longer than twice the recent average." );
+ConVar gl_mali_slow_ms( "gl_mali_slow_ms", "4", FCVAR_ARCHIVE,
+	"A single shader translation / compile / link / validate or texture upload that takes longer than this many milliseconds is written to the log on its own." );
+ConVar gl_mali_prof_stats_sec( "gl_mali_prof_stats_sec", "60", FCVAR_ARCHIVE,
+	"Seconds between the profiler summary lines in the log. 0 = no summary lines." );
 
 //-----------------------------------------------------------------------------
 // GL constants (declared locally so this file does not depend on which GL headers are in use)
@@ -1588,13 +1611,25 @@ void MaliOpt_ProgramStore( unsigned int program, uint64_t key )
 	s_pc.storeUs += NowUs() - t0;
 }
 
-CON_COMMAND( gl_mali_stats, "Print the Mali optimization statistics (program binary cache)." )
+// counters of the program cache for the hitch profiler (section 6); read without the lock, a torn read only makes one number a little off
+static void MaliPC_Counters( uint32_t *pHits, uint32_t *pMisses, uint32_t *pStores, uint32_t *pPrograms )
+{
+	*pHits = s_pc.hits;
+	*pMisses = s_pc.misses;
+	*pStores = s_pc.stores;
+	*pPrograms = s_pc.count;
+}
+
+static void MaliProf_PrintStats( void );			// section 6
+
+CON_COMMAND( gl_mali_stats, "Print the Mali optimization statistics (hitch profiler, lazy shader translation, program binary cache)." )
 {
 	ConMsg( "Mali optimizations: %s\n", MaliOpt_IsMali() ? "enabled" : "disabled / not a Mali GPU" );
 	{
 		const MaliGpuIdentity *id = MaliOpt_Identity();
 		ConMsg( "GPU: \"%s\"  VendorID 0x%04X  DeviceID 0x%04X  (gl_gpu_info for details)\n", id->name, (unsigned)id->vendorId, (unsigned)id->deviceId );
 	}
+	MaliProf_PrintStats();
 	if ( s_pc.state <= 0 )
 	{
 		ConMsg( "Program binary cache: off\n" );
@@ -1617,7 +1652,510 @@ bool MaliOpt_ProgramLoad( unsigned int, uint64_t )					{ return false; }
 void MaliOpt_ProgramPrepareLink( unsigned int )						{}
 void MaliOpt_ProgramStore( unsigned int, uint64_t )					{}
 
+static void MaliPC_Counters( uint32_t *pHits, uint32_t *pMisses, uint32_t *pStores, uint32_t *pPrograms )
+{
+	*pHits = *pMisses = *pStores = *pPrograms = 0;
+}
+
+static void MaliProf_PrintStats( void );			// section 6
+
+CON_COMMAND( gl_mali_stats, "Print the Mali optimization statistics (hitch profiler, lazy shader translation)." )
+{
+	MaliProf_PrintStats();
+}
+
 #endif // MALIOPT_POSIX
+
+//-----------------------------------------------------------------------------
+// 6. Hitch profiler
+//
+// Everything here runs on the thread that owns the GL context (the same one that calls Present), so the counters are plain integers.
+//-----------------------------------------------------------------------------
+
+int g_nMaliProfOn = 1;
+
+namespace
+{
+	const char *const kProfCatName[kMaliProfNumCats] = { "xlat", "compile", "link", "validate", "tex", "swap" };
+	const char *const kProfCatLong[kMaliProfNumCats] = { "shader translation", "shader compile", "program link", "program validate", "texture upload", "swap" };
+
+	struct ProfAcc
+	{
+		uint64_t	us[kMaliProfNumCats];
+		uint32_t	n[kMaliProfNumCats];
+	};
+
+	struct ProfState			// static storage: starts zeroed
+	{
+		bool		init;
+		bool		cmdOff;						// -gl_no_prof
+		uint64_t	lastFrameUs;
+		double		emaMs;						// average length of the frames that were not hitches
+		ProfAcc		frame;						// since the last frame end
+		ProfAcc		win;						// since the last summary line
+		ProfAcc		tot;						// since the start
+		uint32_t	ctrWin[kMaliProfNumCounters];
+		uint32_t	ctrTot[kMaliProfNumCounters];
+		uint64_t	winStartUs;
+		uint32_t	winFrames, winOver25, winOver50, winOver100, winHitches;
+		double		winWorstMs, winSumMs;
+		uint32_t	totFrames, totHitches;
+		double		totWorstMs, totSumMs;
+		uint32_t	hitchLogged, slowLogged;
+		uint32_t	prevHits, prevMisses;		// program cache counters at the previous frame end
+	};
+
+	ProfState s_prof;
+
+	const uint32_t kMaxHitchLines	= 300;		// then only the summary lines (plus one reminder)
+	const uint32_t kMaxSlowLines	= 200;
+
+	void ProfAppend( char *buf, size_t cap, const char *fmt, ... )
+	{
+		const size_t len = strlen( buf );
+		if ( len + 1 >= cap )
+			return;
+		va_list ap;
+		va_start( ap, fmt );
+		vsnprintf( buf + len, cap - len, fmt, ap );
+		va_end( ap );
+	}
+}
+
+uint64_t MaliProf_NowUs()
+{
+#if MALIOPT_POSIX
+	struct timespec ts;
+	clock_gettime( CLOCK_MONOTONIC, &ts );
+	return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull + 1ull;		// +1: never 0, CMaliProfScope uses 0 for "not timing"
+#else
+	return 1;
+#endif
+}
+
+// Reads the switches the first time something is measured (or a frame ends), so -gl_no_prof is respected from the start.
+static void ProfInit()
+{
+	ProfState &P = s_prof;
+
+	P.init = true;
+	P.cmdOff = CommandLine()->FindParm( "-gl_no_prof" ) != 0;
+	g_nMaliProfOn = ( !P.cmdOff && gl_mali_prof.GetBool() ) ? 1 : 0;
+	if ( g_nMaliProfOn )
+	{
+		Msg( "Togles hitch profiler: ON. Frames longer than %.0f ms and twice the average are logged with the step that caused them, steps slower than %.0f ms are logged on their own, "
+			"summary every %d s (gl_mali_prof, gl_mali_hitch_ms, gl_mali_slow_ms, gl_mali_prof_stats_sec; console command gl_mali_stats).\n",
+			gl_mali_hitch_ms.GetFloat(), gl_mali_slow_ms.GetFloat(), gl_mali_prof_stats_sec.GetInt() );
+	}
+	uint32_t nStores = 0, nPrograms = 0;
+	MaliPC_Counters( &P.prevHits, &P.prevMisses, &nStores, &nPrograms );
+	P.lastFrameUs = 0;
+}
+
+void MaliProf_Counter( int counter, unsigned int n )
+{
+	if ( (unsigned)counter >= (unsigned)kMaliProfNumCounters )
+		return;
+	s_prof.ctrWin[counter] += n;
+	s_prof.ctrTot[counter] += n;
+}
+
+void MaliProf_Add( int cat, uint64_t us, const char *a, const char *b, const char *c )
+{
+	if ( (unsigned)cat >= (unsigned)kMaliProfNumCats )
+		return;
+
+	if ( !s_prof.init )
+		ProfInit();
+	if ( !g_nMaliProfOn )
+		return;
+
+	s_prof.frame.us[cat] += us;
+	s_prof.frame.n[cat]++;
+
+	if ( cat != kMaliProfSwap && s_prof.slowLogged < kMaxSlowLines )
+	{
+		const float flSlowMs = gl_mali_slow_ms.GetFloat();
+		if ( flSlowMs > 0.0f && (double)us >= (double)flSlowMs * 1000.0 )
+		{
+			++s_prof.slowLogged;
+			Msg( "Togles slow %s: %.1f ms%s%s%s%s%s%s\n", kProfCatLong[cat], (double)us / 1000.0,
+				a ? " " : "", a ? a : "", b ? " " : "", b ? b : "", c ? " " : "", c ? c : "" );
+			if ( s_prof.slowLogged == kMaxSlowLines )
+				Msg( "Togles slow steps: %u lines written, no more single steps are logged (the hitch and summary lines go on)\n", (unsigned)kMaxSlowLines );
+		}
+	}
+}
+
+static void MaliProf_AppendAcc( char *line, size_t cap, const ProfAcc &acc, bool bAllCats, uint32_t nHits, uint32_t nMisses )
+{
+	for ( int cat = 0; cat < kMaliProfNumCats; ++cat )
+	{
+		if ( !acc.n[cat] && !bAllCats )
+			continue;
+		if ( cat == kMaliProfSwap )
+			ProfAppend( line, cap, " | %s %.1f", kProfCatName[cat], (double)acc.us[cat] / 1000.0 );
+		else
+			ProfAppend( line, cap, " | %s %ux %.1f", kProfCatName[cat], (unsigned)acc.n[cat], (double)acc.us[cat] / 1000.0 );
+		if ( cat == kMaliProfLink && ( nHits || nMisses ) )
+			ProfAppend( line, cap, " (cache hit %u, miss %u)", (unsigned)nHits, (unsigned)nMisses );
+	}
+}
+
+void MaliProf_FrameEnd()
+{
+	ProfState &P = s_prof;
+
+	if ( !P.init )
+		ProfInit();
+
+	const bool bOn = !P.cmdOff && gl_mali_prof.GetBool();
+	g_nMaliProfOn = bOn ? 1 : 0;
+	if ( !bOn )
+	{
+		memset( &P.frame, 0, sizeof( P.frame ) );
+		P.lastFrameUs = 0;
+		return;
+	}
+
+	const uint64_t now = MaliProf_NowUs();
+	if ( !P.lastFrameUs )
+	{
+		// first frame (or the profiler was switched on again): nothing to compare with yet
+		P.lastFrameUs = now;
+		P.winStartUs = now;
+		memset( &P.frame, 0, sizeof( P.frame ) );
+		return;
+	}
+
+	const uint64_t dtUs = now - P.lastFrameUs;
+	P.lastFrameUs = now;
+	const double ms = (double)dtUs / 1000.0;
+
+	uint32_t nHits = 0, nMisses = 0, nStores = 0, nPrograms = 0;
+	MaliPC_Counters( &nHits, &nMisses, &nStores, &nPrograms );
+	const uint32_t dHits = nHits - P.prevHits, dMisses = nMisses - P.prevMisses;
+	P.prevHits = nHits;
+	P.prevMisses = nMisses;
+
+	// ---- this frame -----------------------------------------------------------------------
+	++P.totFrames;
+	++P.winFrames;
+	P.totSumMs += ms;
+	P.winSumMs += ms;
+	if ( ms > P.totWorstMs )
+		P.totWorstMs = ms;
+	if ( ms > P.winWorstMs )
+		P.winWorstMs = ms;
+	if ( ms > 25.0 )
+		++P.winOver25;
+	if ( ms > 50.0 )
+		++P.winOver50;
+	if ( ms > 100.0 )
+		++P.winOver100;
+
+	const double thrMs = ( gl_mali_hitch_ms.GetFloat() > 2.0 * P.emaMs ) ? (double)gl_mali_hitch_ms.GetFloat() : 2.0 * P.emaMs;
+	const bool bHitch = P.totFrames > 30 && P.emaMs > 0.0 && ms > thrMs;
+	if ( !bHitch && ms < 200.0 )
+		P.emaMs = ( P.emaMs > 0.0 ) ? P.emaMs + ( ms - P.emaMs ) * ( 1.0 / 32.0 ) : ms;
+
+	if ( bHitch )
+	{
+		++P.totHitches;
+		++P.winHitches;
+		if ( P.hitchLogged < kMaxHitchLines )
+		{
+			++P.hitchLogged;
+
+			uint64_t nMeasuredUs = 0;
+			for ( int cat = 0; cat < kMaliProfNumCats; ++cat )
+				nMeasuredUs += P.frame.us[cat];
+			const double unaccountedMs = ( dtUs > nMeasuredUs ) ? (double)( dtUs - nMeasuredUs ) / 1000.0 : 0.0;
+
+			char line[640];
+			snprintf( line, sizeof( line ), "Togles hitch: frame %.1f ms (avg %.1f, frame #%u)", ms, P.emaMs, (unsigned)P.totFrames );
+			MaliProf_AppendAcc( line, sizeof( line ), P.frame, false, dHits, dMisses );
+			ProfAppend( line, sizeof( line ), " | unaccounted %.1f\n", unaccountedMs );
+			Msg( "%s", line );
+
+			if ( P.hitchLogged == kMaxHitchLines )
+				Msg( "Togles hitch: %u lines written, no more hitches are listed (the counts stay in the summary lines)\n", (unsigned)kMaxHitchLines );
+		}
+	}
+
+	for ( int cat = 0; cat < kMaliProfNumCats; ++cat )
+	{
+		P.win.us[cat] += P.frame.us[cat];
+		P.win.n[cat] += P.frame.n[cat];
+		P.tot.us[cat] += P.frame.us[cat];
+		P.tot.n[cat] += P.frame.n[cat];
+	}
+	memset( &P.frame, 0, sizeof( P.frame ) );
+
+	// ---- summary line ---------------------------------------------------------------------
+	const int nPeriodSec = gl_mali_prof_stats_sec.GetInt();
+	if ( nPeriodSec > 0 && now - P.winStartUs >= (uint64_t)nPeriodSec * 1000000ull && P.winFrames )
+	{
+		char line[900];
+		snprintf( line, sizeof( line ), "Togles prof (%d s): %u frames, avg %.1f ms, worst %.1f ms | frames >25 ms: %u, >50 ms: %u, >100 ms: %u, hitches listed: %u",
+			(int)( ( now - P.winStartUs + 500000ull ) / 1000000ull ), (unsigned)P.winFrames, P.winSumMs / P.winFrames, P.winWorstMs,
+			(unsigned)P.winOver25, (unsigned)P.winOver50, (unsigned)P.winOver100, (unsigned)P.winHitches );
+
+		ProfAcc perFrame = P.win;			// swap is shown per frame, the rest as totals
+		perFrame.us[kMaliProfSwap] /= P.winFrames;
+		MaliProf_AppendAcc( line, sizeof( line ), perFrame, true, 0, 0 );
+		ProfAppend( line, sizeof( line ), "/frame" );
+
+		uint32_t nPcHits = 0, nPcMisses = 0, nPcStores = 0, nPcPrograms = 0;
+		MaliPC_Counters( &nPcHits, &nPcMisses, &nPcStores, &nPcPrograms );
+		if ( nPcPrograms || nPcHits || nPcMisses )
+			ProfAppend( line, sizeof( line ), " | program cache: restored %u, compiled %u, file %u programs", (unsigned)nPcHits, (unsigned)nPcMisses, (unsigned)nPcPrograms );
+
+		if ( P.ctrTot[kMaliCtrLazyCreated] )
+			ProfAppend( line, sizeof( line ), " | lazy shaders: created %u, translated %u, deleted unused %u (all time)",
+				(unsigned)P.ctrTot[kMaliCtrLazyCreated], (unsigned)P.ctrTot[kMaliCtrLazyTranslated], (unsigned)P.ctrTot[kMaliCtrLazyDropped] );
+		if ( P.ctrTot[kMaliCtrUniformFast] || P.ctrTot[kMaliCtrUniformSlow] )
+			ProfAppend( line, sizeof( line ), " | uniform lookups: fast %u pairs, slow %u pairs, %u calls saved (all time)",
+				(unsigned)P.ctrTot[kMaliCtrUniformFast], (unsigned)P.ctrTot[kMaliCtrUniformSlow], (unsigned)P.ctrTot[kMaliCtrUniformSaved] );
+		ProfAppend( line, sizeof( line ), "\n" );
+		Msg( "%s", line );
+
+		memset( &P.win, 0, sizeof( P.win ) );
+		memset( P.ctrWin, 0, sizeof( P.ctrWin ) );
+		P.winStartUs = now;
+		P.winFrames = P.winOver25 = P.winOver50 = P.winOver100 = P.winHitches = 0;
+		P.winWorstMs = P.winSumMs = 0.0;
+	}
+}
+
+static void MaliProf_PrintStats( void )
+{
+	const ProfState &P = s_prof;
+
+	ConMsg( "Hitch profiler: %s\n", ( !P.cmdOff && gl_mali_prof.GetBool() ) ? "on" : "off" );
+	if ( P.totFrames )
+	{
+		ConMsg( "  %u frames, average %.1f ms, worst %.1f ms, %u hitches (frames over %.0f ms and twice the average %.1f ms)\n",
+			(unsigned)P.totFrames, P.totSumMs / P.totFrames, P.totWorstMs, (unsigned)P.totHitches, gl_mali_hitch_ms.GetFloat(), P.emaMs );
+		for ( int cat = 0; cat < kMaliProfNumCats; ++cat )
+		{
+			ConMsg( "  %-20s %7u x  %9.1f ms total  %7.3f ms each\n", kProfCatLong[cat], (unsigned)P.tot.n[cat], (double)P.tot.us[cat] / 1000.0,
+				P.tot.n[cat] ? (double)P.tot.us[cat] / 1000.0 / P.tot.n[cat] : 0.0 );
+		}
+	}
+	ConMsg( "Lazy shader translation: %s. Shaders created %u, translated when first needed %u, deleted without ever being translated %u\n",
+		MaliOpt_LazyXlatActive() ? "on" : "off", (unsigned)P.ctrTot[kMaliCtrLazyCreated], (unsigned)P.ctrTot[kMaliCtrLazyTranslated], (unsigned)P.ctrTot[kMaliCtrLazyDropped] );
+	ConMsg( "Uniform array locations: %u pairs from the fast path, %u pairs asked one by one, %u glGetUniformLocation calls saved\n",
+		(unsigned)P.ctrTot[kMaliCtrUniformFast], (unsigned)P.ctrTot[kMaliCtrUniformSlow], (unsigned)P.ctrTot[kMaliCtrUniformSaved] );
+}
+
+//-----------------------------------------------------------------------------
+// 7. Uniform array locations
+//-----------------------------------------------------------------------------
+
+namespace
+{
+	const int	kUniformVerifyPairs = 12;		// the first pairs that use the fast path are compared with the driver, element by element
+	int			s_nUniformVerified = 0;
+	bool		s_bUniformFastOff = false;		// set when a comparison failed: the driver numbers array elements some other way
+
+	inline int UniformLoc( unsigned int program, char prefix, int idx )
+	{
+		char name[24];
+		snprintf( name, sizeof( name ), "%cc[%d]", prefix, idx );
+		return gGL->glGetUniformLocation( program, name );
+	}
+
+	// the plain loop: ask for every element until one does not exist
+	int UniformLocsOneByOne( unsigned int program, char prefix, int count, int *locs, int first )
+	{
+		for ( int j = first; j < count; ++j )
+		{
+			const int l = UniformLoc( program, prefix, j );
+			locs[j] = l;
+			if ( l < 0 )
+				return j;
+		}
+		return count;
+	}
+}
+
+int MaliOpt_UniformArrayLocations( unsigned int program, char prefix, int count, int *locs )
+{
+	if ( count <= 0 )
+		return 0;
+
+	const int loc0 = UniformLoc( program, prefix, 0 );
+	locs[0] = loc0;
+	if ( loc0 < 0 )
+		return 0;
+	if ( count == 1 )
+		return 1;
+
+	if ( !s_bUniformFastOff && MaliOpt_IsMali() && gl_mali_uniform_fastpath.GetBool() )
+	{
+		// does element k live at loc0 + k? look at the second, the middle and the last element
+		const int probes[3] = { 1, count / 2, count - 1 };
+		bool bConsecutive = true;
+		int nProbes = 0;
+		for ( int i = 0; i < 3 && bConsecutive; ++i )
+		{
+			if ( probes[i] < 1 || ( i > 0 && probes[i] <= probes[i - 1] ) )
+				continue;
+			++nProbes;
+			bConsecutive = ( UniformLoc( program, prefix, probes[i] ) == loc0 + probes[i] );
+		}
+
+		if ( bConsecutive )
+		{
+			for ( int k = 1; k < count; ++k )
+				locs[k] = loc0 + k;
+
+			if ( s_nUniformVerified < kUniformVerifyPairs || gl_mali_uniform_verify.GetBool() )
+			{
+				// compare with the driver, every element
+				++s_nUniformVerified;
+				int nBad = -1;
+				for ( int k = 1; k < count; ++k )
+				{
+					if ( UniformLoc( program, prefix, k ) != loc0 + k )
+					{
+						nBad = k;
+						break;
+					}
+				}
+				if ( nBad >= 0 )
+				{
+					s_bUniformFastOff = true;
+					Warning( "Mali optimizations: the driver does not number the elements of %cc[] consecutively (element %d of %d); asking for every element from now on\n", prefix, nBad, count );
+					MaliProf_Counter( kMaliCtrUniformSlow );
+					return UniformLocsOneByOne( program, prefix, count, locs, 1 );
+				}
+				if ( s_nUniformVerified == kUniformVerifyPairs && !gl_mali_uniform_verify.GetBool() )
+					Msg( "Mali optimizations: uniform array locations checked against the driver on %d shader pairs, all consecutive; the rest are computed\n", kUniformVerifyPairs );
+			}
+			else
+			{
+				MaliProf_Counter( kMaliCtrUniformSaved, (unsigned)( count - 1 - nProbes ) );
+			}
+
+			MaliProf_Counter( kMaliCtrUniformFast );
+			return count;
+		}
+	}
+
+	MaliProf_Counter( kMaliCtrUniformSlow );
+	return UniformLocsOneByOne( program, prefix, count, locs, 1 );
+}
+
+//-----------------------------------------------------------------------------
+// 8. Lazy shader translation
+//-----------------------------------------------------------------------------
+
+bool MaliOpt_LazyXlatActive()
+{
+	static int s_nState = -1;			// -1 = not decided yet
+	if ( s_nState < 0 )
+	{
+		if ( !gGL )
+			return false;				// too early, ask again later
+
+		s_nState = ( MaliOpt_IsMali() && gl_mali_lazy_xlat.GetBool() && !CommandLine()->FindParm( "-gl_no_lazy_xlat" ) ) ? 1 : 0;
+		Msg( "Mali optimizations: lazy shader translation %s\n", s_nState ? "ENABLED" : "disabled" );
+	}
+	return s_nState > 0;
+}
+
+size_t MaliOpt_D3DBytecodeBytes( const uint32_t *pFunction, bool bVertexShader )
+{
+	if ( !pFunction )
+		return 0;
+
+	// version token: 0xFFFE.... = vertex shader, 0xFFFF.... = pixel shader; only shader model 2 and 3 carry the length of every instruction
+	const uint32_t nVersion = pFunction[0];
+	if ( ( nVersion & 0xFFFF0000u ) != ( bVertexShader ? 0xFFFE0000u : 0xFFFF0000u ) )
+		return 0;
+	const uint32_t nMajor = ( nVersion >> 8 ) & 0xFFu;
+	if ( nMajor < 2 || nMajor > 3 )
+		return 0;
+
+	const size_t kMaxTokens = 65536;		// 256 KB; the largest Source shaders are a few KB
+	size_t i = 1;
+	while ( i < kMaxTokens )
+	{
+		const uint32_t tok = pFunction[i];
+		if ( tok == 0x0000FFFFu )			// D3DSIO_END
+			return ( i + 1 ) * sizeof( uint32_t );
+
+		if ( ( tok & 0xFFFFu ) == 0xFFFEu )	// D3DSIO_COMMENT: the size in DWORDs is in bits 16..30
+			i += 1 + ( ( tok >> 16 ) & 0x7FFFu );
+		else
+			i += 1 + ( ( tok >> 24 ) & 0x0Fu );	// size of the operands in DWORDs
+	}
+	return 0;
+}
+
+static bool s_bDeferShaderObject = false;
+
+void MaliLazy_SetDeferShaderObject( bool bDefer )	{ s_bDeferShaderObject = bDefer; }
+bool MaliLazy_DeferShaderObject()					{ return s_bDeferShaderObject; }
+
+//-----------------------------------------------------------------------------
+// 9. ASTC decode mode
+//-----------------------------------------------------------------------------
+
+#define MALIGL_TEXTURE_2D						0x0DE1
+#define MALIGL_TEXTURE_CUBE_MAP					0x8513
+#define MALIGL_RGBA8							0x8058
+#define MALIGL_EXTENSIONS						0x1F03
+#define MALIGL_TEXTURE_ASTC_DECODE_PRECISION	0x8F69
+
+typedef void				( *MaliPFN_TexParameteri )( unsigned int target, unsigned int pname, int param );
+typedef const unsigned char	*( *MaliPFN_GetString )( unsigned int name );
+
+static bool MaliExtensionListed( const char *pList, const char *pName )
+{
+	if ( !pList || !pName || !pName[0] )
+		return false;
+	const size_t n = strlen( pName );
+	for ( const char *p = pList; ( p = strstr( p, pName ) ) != NULL; p += n )
+	{
+		const bool bStart = ( p == pList ) || p[-1] == ' ';
+		const bool bEnd = p[n] == ' ' || p[n] == '\0';
+		if ( bStart && bEnd )
+			return true;
+	}
+	return false;
+}
+
+bool MaliOpt_AstcDecodeRGBA8( unsigned int target )
+{
+	static int s_nState = -1;			// -1 = not decided yet, 1 = on
+	static MaliPFN_TexParameteri s_pfnTexParameteri = NULL;
+
+	if ( s_nState < 0 )
+	{
+		if ( !gGL )
+			return false;
+
+		s_nState = 0;
+		if ( MaliOpt_IsMali() && gl_mali_astc_decode_rgba8.GetBool() )
+		{
+			s_pfnTexParameteri = (MaliPFN_TexParameteri)MaliOpt_GetProc( "glTexParameteri" );
+			MaliPFN_GetString pfnGetString = (MaliPFN_GetString)MaliOpt_GetProc( "glGetString" );
+			const char *pExt = pfnGetString ? (const char *)pfnGetString( MALIGL_EXTENSIONS ) : NULL;
+			if ( s_pfnTexParameteri && MaliExtensionListed( pExt, "GL_EXT_texture_compression_astc_decode_mode" ) )
+				s_nState = 1;
+		}
+		Msg( "Mali optimizations: ASTC decode mode RGBA8 %s\n", s_nState ? "ENABLED" : "off (switched off, or the driver has no GL_EXT_texture_compression_astc_decode_mode)" );
+	}
+
+	if ( s_nState <= 0 || ( target != MALIGL_TEXTURE_2D && target != MALIGL_TEXTURE_CUBE_MAP ) )
+		return false;
+
+	s_pfnTexParameteri( target, MALIGL_TEXTURE_ASTC_DECODE_PRECISION, MALIGL_RGBA8 );
+	return true;
+}
 
 CON_COMMAND( gl_gpu_info, "Print the GPU identity Togles detected (VendorID / DeviceID) and whether this Mali-only build supports it." )
 {
