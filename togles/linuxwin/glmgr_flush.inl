@@ -1,6 +1,7 @@
 // BE VERY VERY CAREFUL what you do in these function. They are extremely hot, and calling the wrong GL API's in here will crush perf. (especially on NVidia threaded drivers).
 
 #include "togles/linuxwin/glmgr.h"
+#include "mali_opt.h"
 
 FORCEINLINE uint32 bitmix32(uint32 a)
 {
@@ -138,6 +139,7 @@ FORCEINLINE void GLMContext::FlushDrawStates( uint nStartIndex, uint nEndIndex, 
 	
 #if GLMDEBUG
 	// Depth compare mode check
+	MaliLazy_EnsureProgram( m_drawingProgram[kGLMFragmentProgram] );	// the sampler masks of a lazily translated shader (mali_opt.h) come from its translation
 	uint nCurMask = 1, nShaderSamplerMask = m_drawingProgram[kGLMFragmentProgram]->m_samplerMask;
 	for ( int nSamplerIndex = 0; nSamplerIndex < GLM_SAMPLER_COUNT; ++nSamplerIndex, nCurMask <<= 1 )
 	{
@@ -208,6 +210,13 @@ FORCEINLINE void GLMContext::FlushDrawStates( uint nStartIndex, uint nEndIndex, 
 	if ( m_bDirtyPrograms )
 	{
 		m_bDirtyPrograms = false;
+
+		// Shaders that are translated on first use (mali_opt.h) get their GLSL, high water marks, sampler masks and attribute map here, before
+		// anything below looks at them. Costs nothing for a shader that has been translated: it is a compare of the first bytes of its text.
+		if ( !MaliLazy_EnsureProgram( m_drawingProgram[ kGLMVertexProgram ] ) || !MaliLazy_EnsureProgram( m_drawingProgram[ kGLMFragmentProgram ] ) )
+		{
+			goto flush_error_exit;
+		}
 
 		CGLMShaderPair *pNewPair = m_pairCache->SelectShaderPair( m_drawingProgram[ kGLMVertexProgram ], m_drawingProgram[ kGLMFragmentProgram ], 0 );
 
