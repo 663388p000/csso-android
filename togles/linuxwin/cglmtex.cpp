@@ -35,6 +35,7 @@ extern "C" {
 #include "tier0/icommandline.h"
 #include "glmtexinlines.h"
 #include "astc_texcompress.h"
+#include "mali_opt.h"			// hitch profiler scopes and the ASTC decode mode
 #include "arm_neon_opt.h"		// NEON texel padding / conversion (AArch64 only; scalar fallback otherwise)
 #include "tier0/dbg.h"		// Warning() / Msg() / Error() for the ASTC upload diagnostics		// added: ASTC LDR/HDR runtime recompression for ARGB/RGBA formats
 
@@ -74,6 +75,17 @@ static inline bool GLMTexIsAstcManaged( const GLMTexLayout *layout )
 		return false;
 
 	return ASTC_IsEligibleFormat( (int)layout->m_key.m_texFormat ) || ( layout->m_format->m_chunkSize != 1 );
+}
+
+// Can the sampler decode this ASTC texture to RGBA8 instead of half floats (GL_EXT_texture_compression_astc_decode_mode, see mali_opt.h)?
+// Not when the source carries more than 8 bits per channel or is HDR: the 8 bit decode would clamp or quantize what the encoder kept.
+static inline bool GLMTexAstcDecodesAs8Bit( const GLMTexLayout *layout )
+{
+	// (the 10 bit formats are not created by this engine, see the format table below)
+	if ( layout->m_key.m_texFormat == D3DFMT_A16B16G16R16 )
+		return false;
+
+	return !ASTC_IsHDRFormat( (int)layout->m_key.m_texFormat );
 }
 
 // Should the CPU copy of the texels outlive Unlock()? An ASTC level can't be patched from the GPU copy
@@ -971,6 +983,8 @@ CGLMTex::CGLMTex( GLMContext *ctx, GLMTexLayout *layout, uint levels, const char
 
 	// caller has responsibility to make 'ctx' current, but we check to be sure.
 	ctx->CheckCurrent();
+
+	CMaliProfScope profTex( kMaliProfTexture, debugLabel );	// hitch profiler (mali_opt.h)
 						
 	m_nLastResolvedBatchCounter = ctx->m_nBatchCounter;
 		
@@ -1075,6 +1089,10 @@ CGLMTex::CGLMTex( GLMContext *ctx, GLMTexLayout *layout, uint levels, const char
 
 	m_SamplingParams.SetToDefaults();
 	m_SamplingParams.SetToTarget( m_texGLTarget );
+
+	// the texture is bound on the active TMU: ask the sampler to decode ASTC to RGBA8 where the source is 8 bit anyway (Mali, mali_opt.h)
+	if ( GLMTexIsAstcManaged( m_layout ) && GLMTexAstcDecodesAs8Bit( m_layout ) )
+		MaliOpt_AstcDecodeRGBA8( m_texGLTarget );
 	
 	// OK, our texture now exists and is bound on the active TMU.  Not drawable yet though.
 		
@@ -3858,6 +3876,8 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 {
 	//if ( m_nBindlessHashNumEntries )
 	//	return;
+
+	CMaliProfScope profTex( kMaliProfTexture, m_debugLabel );	// hitch profiler (mali_opt.h)
 	
 	GLMRegion	writeBox;
 
