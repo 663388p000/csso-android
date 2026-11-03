@@ -33,6 +33,7 @@
 #include "tier1/strtools.h"
 #include "tier1/utlbuffer.h"
 #include "dx9asmtogl2.h"
+#include "mali_opt.h"
 #include "mathlib/vmatrix.h"
 #include "materialsystem/IShader.h"
 
@@ -3855,6 +3856,523 @@ static int ShadowDepthSamplerMaskFromName( const char *pName )
 
 #endif
 
+//===============================================================================
+// Shader translation helpers
+//
+// The options the translator gets, and the reading of the metadata it writes into the first comments of the GLSL, are shared by the
+// shaders that are translated when the engine creates them and by the lazily translated ones (mali_opt.h), so both end up identical.
+//===============================================================================
+
+static uint GLMPixelShaderTranslatorOptions( GLMContext *pCtx, const char *pShaderName )
+{
+	uint glslPixelShaderOptions = D3DToGL_OptionUseEnvParams;// | D3DToGL_OptionAllowStaticControlFlow;
+
+
+	// Fake SRGB mode - needed on R500, probably indefinitely.
+	// Do this stuff if caps show m_needsFakeSRGB=true and the sRGBWrite state is true
+	// (but not if it's engine_post which is special)
+
+	if (!pCtx->Caps().m_hasGammaWrites)
+	{
+		if ( pShaderName )
+		{
+			if ( !V_stristr( pShaderName, "engine_post" ) )
+			{
+				glslPixelShaderOptions |= D3DToGL_OptionSRGBWriteSuffix;
+			}
+		}
+	}
+	return glslPixelShaderOptions;
+}
+
+static uint GLMVertexShaderTranslatorOptions( GLMContext *pCtx )
+{
+	uint glslVertexShaderOptions = D3DToGL_OptionUseEnvParams | D3DToGL_OptionDoFixupZ | D3DToGL_OptionDoFixupY;
+
+	if ( pCtx->Caps().m_hasNativeClipVertexMode )
+	{
+		// note the matched trickery over in IDirect3DDevice9::FlushStates - 
+		// if on a chipset that does no have native gl_ClipVertex support, then
+		// omit writes to gl_ClipVertex, and instead submit plane equations that have been altered,
+		// and clipping will take place in GL space using gl_Position instead of gl_ClipVertex.
+
+		// note that this is very much a hack to mate up with ATI R5xx hardware constraints, and with older
+		// drivers even for later ATI parts like r6xx/r7xx.   And it doesn't work on NV parts, so you really
+		// do have to choose the right way to go.
+
+		glslVertexShaderOptions |= D3DToGL_OptionDoUserClipPlanes; 
+	}
+
+	if ( !CommandLine()->CheckParm("-disableboneuniformbuffers") )
+	{
+		// If using GLSL, enabling a uniform buffer specifically for bone registers. (Not currently supported with ARB shaders, which are not optimized at all anyway.)
+		glslVertexShaderOptions |= D3DToGL_OptionGenerateBoneUniformBuffer;
+	}
+	return glslVertexShaderOptions;
+}
+
+// Reads what the translator wrote into the comments at the top of a pixel shader's GLSL (//HIGHWATER-, //SAMPLERMASK-, ...) into the shader and its program.
+static void GLMReadPixelShaderMeta( IDirect3DPixelShader9 *newprog, char *pText )
+{
+	{
+		// find the highwater mark
+		char *highWaterPrefix = "//HIGHWATER-";		// try to arrange this so it can work with pure GLSL if needed
+		char *highWaterStr = strstr( pText, highWaterPrefix );
+		if (highWaterStr)
+		{
+			char *highWaterActualData = highWaterStr + strlen( highWaterPrefix );
+
+			int value = -1;
+			sscanf( highWaterActualData, "%d", &value );
+
+			newprog->m_pixHighWater = value;
+			newprog->m_pixProgram->m_descs[kGLMGLSL].m_highWater = value;
+		}
+		else
+		{
+			Assert(!"couldn't find sampler map in pixel shader");
+		}
+	}
+
+	{
+		// find the sampler map
+		char *samplerMaskPrefix = "//SAMPLERMASK-";		// try to arrange this so it can work with pure GLSL if needed
+
+		char *samplerMaskStr = strstr( pText, samplerMaskPrefix );
+		if (samplerMaskStr)
+		{
+			char *samplerMaskActualData = samplerMaskStr + strlen( samplerMaskPrefix );
+
+			int value = -1;
+			sscanf( samplerMaskActualData, "%04x", &value );
+
+			newprog->m_pixSamplerMask = value;
+			newprog->m_pixProgram->m_samplerMask = value;	// helps GLM maintain a better linked pair cache even when SRGB sampler state changes
+
+			int nMaxReg;
+			for ( nMaxReg = 31; nMaxReg >= 0; --nMaxReg )
+				if ( value & ( 1 << nMaxReg ) )
+					break;
+
+			newprog->m_pixProgram->m_maxSamplers = nMaxReg + 1;
+
+			int nNumUsedSamplers = 0;
+			for ( int i = 31; i >= 0; --i)
+				if ( value & ( 1 << i ) )
+					nNumUsedSamplers++;
+			newprog->m_pixProgram->m_nNumUsedSamplers = nNumUsedSamplers;
+		}
+		else
+		{
+			Assert(!"couldn't find sampler map in pixel shader");
+		}
+	}
+
+	{
+		// find the sampler map
+		char *samplerTypesPrefix = "//SAMPLERTYPES-";		// try to arrange this so it can work with pure GLSL if needed
+
+		char *samplerTypesStr = strstr( pText, samplerTypesPrefix );
+		if (samplerTypesStr)
+		{
+			char *samplerTypesActualData = samplerTypesStr + strlen( samplerTypesPrefix );
+
+			int value = -1;
+			sscanf( samplerTypesActualData, "%08x", &value );
+
+			newprog->m_pixSamplerTypes = value;
+			newprog->m_pixProgram->m_samplerTypes = value;	// helps GLM maintain a better linked pair cache even when SRGB sampler state changes
+		}
+		else
+		{
+			Assert(!"couldn't find sampler types in pixel shader");
+		}
+	}
+
+	{
+		// find the fb outputs used by this shader/combo
+		const GLenum buffers[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3 };
+
+		char *fragDataMaskPrefix = "//FRAGDATAMASK-";		
+
+		char *fragDataMaskStr = strstr( pText, fragDataMaskPrefix );
+		if ( fragDataMaskStr )
+		{
+			char *fragDataActualData = fragDataMaskStr + strlen( fragDataMaskPrefix );
+
+			int value = -1;
+			sscanf( fragDataActualData, "%04x", &value );
+
+			newprog->m_pixFragDataMask = value;
+			newprog->m_pixProgram->m_fragDataMask = value;
+
+			newprog->m_pixProgram->m_numDrawBuffers = 0;
+			for( int i = 0; i < 4; i++ )
+			{
+				if( newprog->m_pixProgram->m_fragDataMask & ( 1 << i ) )
+				{
+					newprog->m_pixProgram->m_drawBuffers[ newprog->m_pixProgram->m_numDrawBuffers ] = buffers[ i ];
+					newprog->m_pixProgram->m_numDrawBuffers++;
+				}
+			}
+
+			if( newprog->m_pixProgram->m_numDrawBuffers ==  0 )
+			{
+				Assert(!"couldn't find fragment output in pixel shader");
+				newprog->m_pixProgram->m_drawBuffers[ 0 ] = buffers[ 0 ];
+				newprog->m_pixProgram->m_numDrawBuffers = 1;
+			}
+		}
+		else
+		{
+			newprog->m_pixFragDataMask = 0;
+			newprog->m_pixProgram->m_fragDataMask = 0;
+		}
+
+	}
+}
+
+// The same for a vertex shader (//HIGHWATER-, //HIGHWATERBONE-, //ATTRIBMAP-).
+static void GLMReadVertexShaderMeta( IDirect3DVertexShader9 *newprog, char *pText )
+{
+	// find the highwater mark..
+
+	char *highWaterPrefix = "//HIGHWATER-";		// try to arrange this so it can work with pure GLSL if needed
+	char *highWaterStr = strstr( pText, highWaterPrefix );
+	if (highWaterStr)
+	{
+		char *highWaterActualData = highWaterStr + strlen( highWaterPrefix );
+
+		int value = -1;
+		sscanf( highWaterActualData, "%d", &value );
+
+		newprog->m_vtxHighWater = value;
+		newprog->m_vtxProgram->m_descs[kGLMGLSL].m_highWater = value;
+	}
+	else
+	{
+		Assert(!"couldn't find highwater mark in vertex shader");
+	}
+
+	char *highWaterBonePrefix = "//HIGHWATERBONE-";		// try to arrange this so it can work with pure GLSL if needed
+	char *highWaterBoneStr = strstr( pText, highWaterBonePrefix );
+	if (highWaterBoneStr)
+	{
+		char *highWaterActualData = highWaterBoneStr + strlen( highWaterBonePrefix );
+
+		int value = -1;
+		sscanf( highWaterActualData, "%d", &value );
+
+		newprog->m_vtxHighWaterBone = value;
+		newprog->m_vtxProgram->m_descs[kGLMGLSL].m_VSHighWaterBone = value;
+	}
+	else
+	{
+		newprog->m_vtxHighWaterBone = 0;
+		newprog->m_vtxProgram->m_descs[kGLMGLSL].m_VSHighWaterBone = 0;
+	}
+
+	// find the attrib map..
+	char *attribMapPrefix = "//ATTRIBMAP-";		// try to arrange this so it can work with pure GLSL if needed
+	char *attribMapStr = strstr( pText, attribMapPrefix );
+
+	if (attribMapStr)
+	{
+		char *attribMapActualData = attribMapStr + strlen( attribMapPrefix );
+		uint nMaxVertexAttribs = 0;
+		for( int i=0; i<16; i++)
+		{
+			int value = -1;
+			char *dataItem = attribMapActualData + (i*3);
+			sscanf( dataItem, "%02x", &value );
+			if (value >=0)
+			{
+				// make sure it's not a terminator
+				if (value == 0xBB)
+				{
+					DXABSTRACT_BREAK_ON_ERROR();
+				}
+			}
+			else
+			{
+				// probably an 'xx'... check
+				if ( (dataItem[0] != 'x') || (dataItem[1] != 'x') )
+				{
+					DXABSTRACT_BREAK_ON_ERROR();	// bad news
+				}
+				else
+				{
+					value = 0xBB;		// not likely to see one of these... "fog with usage index 11"
+				}
+			}
+
+			if ( value != 0xBB )
+				nMaxVertexAttribs = i;
+
+			newprog->m_vtxAttribMap[i] = value;
+		}
+
+		newprog->m_vtxProgram->m_maxVertexAttrs = nMaxVertexAttribs + 1;
+		newprog->m_maxVertexAttrs = nMaxVertexAttribs + 1;
+	}
+	else
+	{
+		DXABSTRACT_BREAK_ON_ERROR();	// that's bad...
+	}
+}
+
+//===============================================================================
+// Lazy shader translation (mali_opt.h)
+//
+// CreateVertexShader() / CreatePixelShader() keep a copy of the Direct3D byte code and hand the engine a shader whose program only has a
+// placeholder text (MALI_LAZY_MARK). The translation to GLSL, the compile and every value that comes out of the translation happen in
+// MaliLazy_EnsureProgram(), which GLMContext::FlushDrawStates() / LinkShaderPair() / ValidateShaderPair() / SetProgramPair() call
+// before they look at the program. A shader that is deleted before it is ever needed is never translated.
+//===============================================================================
+
+namespace
+{
+	struct MaliLazyRec
+	{
+		MaliLazyRec		*pNext;					// next record in the hash bucket
+		CGLMProgram		*pProg;					// the placeholder program this record belongs to (the key)
+		void			*pShader;				// the IDirect3DVertexShader9 / IDirect3DPixelShader9 that owns the program
+		bool			bVertex;
+		uint			nOptions;				// the D3DToGL_Option* flags the translator gets
+		int32			nShadowDepthSamplerMask;
+		uint32			nCentroidMask;
+		size_t			nCodeBytes;
+		char			*pDebugLabel;			// copy of the engine's label (it ends up in the GLSL, so it must be the same); NULL if there was none
+		uint32			*pCode;					// the byte code, stored right behind the record
+	};
+
+	const int kMaliLazyBuckets = 4096;			// power of two
+	MaliLazyRec		*s_pMaliLazyBucket[kMaliLazyBuckets];
+	CThreadMutex	s_MaliLazyMutex;			// everything here runs on the GL thread; the lock is only a safety net
+
+	struct MaliLazyLock
+	{
+		MaliLazyLock()	{ s_MaliLazyMutex.Lock(); }
+		~MaliLazyLock()	{ s_MaliLazyMutex.Unlock(); }
+	};
+
+	inline uint MaliLazyHash( const CGLMProgram *pProg )
+	{
+		uint64 v = (uint64)(uintptr_t)pProg >> 4;
+		v *= 0x9E3779B97F4A7C15ULL;
+		return (uint)( v >> 40 ) & ( kMaliLazyBuckets - 1 );
+	}
+
+	void MaliLazyFree( MaliLazyRec *rec )
+	{
+		if ( rec )
+		{
+			free( rec->pDebugLabel );
+			free( rec );
+		}
+	}
+
+	// Copies the byte code. Returns NULL if memory is short; the caller then translates the shader at once, like before.
+	MaliLazyRec *MaliLazyNewRec( bool bVertex, uint nOptions, int32 nShadowDepthSamplerMask, uint32 nCentroidMask, const uint32 *pCode, size_t nCodeBytes, const char *pDebugLabel )
+	{
+		MaliLazyRec *rec = (MaliLazyRec *)malloc( sizeof( MaliLazyRec ) + nCodeBytes );
+		if ( !rec )
+			return NULL;
+
+		memset( rec, 0, sizeof( *rec ) );
+		rec->pCode = (uint32 *)( rec + 1 );
+		memcpy( rec->pCode, pCode, nCodeBytes );
+		rec->nCodeBytes = nCodeBytes;
+		rec->bVertex = bVertex;
+		rec->nOptions = nOptions;
+		rec->nShadowDepthSamplerMask = nShadowDepthSamplerMask;
+		rec->nCentroidMask = nCentroidMask;
+		if ( pDebugLabel )
+		{
+			rec->pDebugLabel = strdup( pDebugLabel );
+			if ( !rec->pDebugLabel )
+			{
+				free( rec );
+				return NULL;
+			}
+		}
+		return rec;
+	}
+
+	void MaliLazyInsert( MaliLazyRec *rec, CGLMProgram *pProg, void *pShader )
+	{
+		MaliLazyLock lock;
+
+		rec->pProg = pProg;
+		rec->pShader = pShader;
+
+		MaliLazyRec **ppHead = &s_pMaliLazyBucket[ MaliLazyHash( pProg ) ];
+
+		// a record that is left over for this address (its program was deleted without telling us) must not be mistaken for the new one
+		for ( MaliLazyRec **pp = ppHead; *pp; )
+		{
+			if ( (*pp)->pProg == pProg )
+			{
+				MaliLazyRec *dead = *pp;
+				*pp = dead->pNext;
+				MaliLazyFree( dead );
+			}
+			else
+			{
+				pp = &(*pp)->pNext;
+			}
+		}
+
+		rec->pNext = *ppHead;
+		*ppHead = rec;
+	}
+
+	// Removes the record of a program from the table and hands it over (NULL if there is none).
+	MaliLazyRec *MaliLazyTake( const CGLMProgram *pProg )
+	{
+		MaliLazyLock lock;
+
+		for ( MaliLazyRec **pp = &s_pMaliLazyBucket[ MaliLazyHash( pProg ) ]; *pp; pp = &(*pp)->pNext )
+		{
+			if ( (*pp)->pProg == pProg )
+			{
+				MaliLazyRec *rec = *pp;
+				*pp = rec->pNext;
+				rec->pNext = NULL;
+				return rec;
+			}
+		}
+		return NULL;
+	}
+}
+
+// A program that carries the placeholder text and has no GL shader object yet.
+static CGLMProgram *MaliLazyNewProgram( GLMContext *pCtx, EGLMProgramType type, const char *pName )
+{
+	static char s_szLazyMark[] = MALI_LAZY_MARK;
+
+	MaliLazy_SetDeferShaderObject( true );
+	CGLMProgram *pProg = new CGLMProgram( pCtx, type );
+	MaliLazy_SetDeferShaderObject( false );
+
+	pProg->SetProgramText( s_szLazyMark );
+	pProg->SetShaderName( pName );
+	return pProg;
+}
+
+// The same translation CreateVertexShader() does when it is not lazy, from the stored byte code.
+static void MaliLazyTranslateVertexShader( MaliLazyRec *rec )
+{
+	IDirect3DVertexShader9 *newprog = (IDirect3DVertexShader9 *)rec->pShader;
+
+	int maxTranslationSize = 500000;	// size of any one translation
+
+	CUtlBuffer transbuf( 5000, maxTranslationSize, CUtlBuffer::TEXT_BUFFER );
+	CUtlBuffer tempbuf( 5000, maxTranslationSize, CUtlBuffer::TEXT_BUFFER );
+
+	// note the GLSL translator wants its own buffer
+	tempbuf.EnsureCapacity( maxTranslationSize );
+
+	CGLMProgram *pProg = newprog->m_vtxProgram;
+
+	bool bVertexShader = false;
+	{
+		CMaliProfScope profXlat( kMaliProfXlat, pProg->m_shaderName );	// only the translation: the compile that follows has its own timer
+		g_D3DToOpenGLTranslatorGLSL.TranslateShader( rec->pCode, &tempbuf, &bVertexShader, rec->nOptions, -1, rec->nCentroidMask, rec->pDebugLabel );
+	}
+
+	transbuf.PutString( (char*)tempbuf.Base() );
+	transbuf.PutString( "\n\n" );	// whitespace
+	Assert( bVertexShader );
+
+	MaliLazy_FinishProgram( pProg, (char *)transbuf.Base() );
+	pProg->m_nCentroidMask = rec->nCentroidMask;
+	pProg->m_bTranslatedProgram = true;
+	pProg->m_maxVertexAttrs = 0;
+	newprog->m_maxVertexAttrs = 0;
+
+	GLMReadVertexShaderMeta( newprog, (char *)transbuf.Base() );
+}
+
+// The same translation CreatePixelShader() does when it is not lazy, from the stored byte code.
+static void MaliLazyTranslatePixelShader( MaliLazyRec *rec )
+{
+	IDirect3DPixelShader9 *newprog = (IDirect3DPixelShader9 *)rec->pShader;
+
+	int maxTranslationSize = 50000;	// size of any one translation
+
+	CUtlBuffer transbuf( 9000, maxTranslationSize, CUtlBuffer::TEXT_BUFFER );
+	CUtlBuffer tempbuf( 9000, maxTranslationSize, CUtlBuffer::TEXT_BUFFER );
+
+	// note the GLSL translator wants its own buffer
+	tempbuf.EnsureCapacity( maxTranslationSize );
+
+	CGLMProgram *pProg = newprog->m_pixProgram;
+
+	bool bVertexShader = false;
+	{
+		CMaliProfScope profXlat( kMaliProfXlat, pProg->m_shaderName );	// only the translation: the compile that follows has its own timer
+		g_D3DToOpenGLTranslatorGLSL.TranslateShader( rec->pCode, &tempbuf, &bVertexShader, rec->nOptions, rec->nShadowDepthSamplerMask, rec->nCentroidMask, rec->pDebugLabel );
+	}
+
+	transbuf.PutString( (char*)tempbuf.Base() );
+	transbuf.PutString( "\n\n" );	// whitespace
+	Assert( !bVertexShader );
+
+	MaliLazy_FinishProgram( pProg, (char *)transbuf.Base() );
+	pProg->m_nCentroidMask = rec->nCentroidMask;
+	pProg->m_nShadowDepthSamplerMask = rec->nShadowDepthSamplerMask;
+	pProg->m_bTranslatedProgram = true;
+	pProg->m_maxVertexAttrs = 0;
+
+	GLMReadPixelShaderMeta( newprog, (char *)transbuf.Base() );
+}
+
+bool MaliLazy_EnsureProgram( CGLMProgram *pProg )
+{
+	if ( !pProg || !MaliLazy_IsPendingText( pProg->m_text ) )
+		return true;
+
+	MaliLazyRec *rec = MaliLazyTake( pProg );
+	if ( !rec )
+	{
+		// the program carries the placeholder but nobody knows its byte code: it can only be drawn as the (empty) shader it is
+		Assert( !"lazy shader without its byte code" );
+		return false;
+	}
+
+	if ( rec->bVertex )
+		MaliLazyTranslateVertexShader( rec );
+	else
+		MaliLazyTranslatePixelShader( rec );
+
+	MaliProf_Counter( kMaliCtrLazyTranslated );
+
+	MaliLazyFree( rec );
+	return true;
+}
+
+void MaliLazy_ForgetProgram( CGLMProgram *pProg )
+{
+	MaliLazyRec *rec = MaliLazyTake( pProg );
+	if ( rec )
+	{
+		MaliProf_Counter( kMaliCtrLazyDropped );
+		MaliLazyFree( rec );
+	}
+}
+
+static inline bool GLMLazyTranslationAllowed()
+{
+#if GLMDEBUG
+	// the shader editor of the debug builds (CGLMEditableTextItem) is made from the first text a program gets, which would be the placeholder
+	return false;
+#else
+	return MaliOpt_LazyXlatActive();
+#endif
+}
+
+
 HRESULT IDirect3DDevice9::CreatePixelShader(CONST DWORD* pFunction,IDirect3DPixelShader9** ppShader, const char *pShaderName, char *pDebugLabel, const uint32 *pCentroidMask )
 {
 	GL_BATCH_PERF_CALL_TIMER;
@@ -3875,6 +4393,40 @@ HRESULT IDirect3DDevice9::CreatePixelShader(CONST DWORD* pFunction,IDirect3DPixe
 		//nCentroidMask = *pCentroidMask;
 	}
 
+	// Lazy translation (mali_opt.h): keep a copy of the byte code and translate the shader when a draw first needs it. Anything that
+	// does not look like a shader model 2 / 3 pixel shader, or an allocation that fails, takes the normal path below.
+	if ( GLMLazyTranslationAllowed() )
+	{
+		const size_t nCodeBytes = MaliOpt_D3DBytecodeBytes( (const uint32_t *)pFunction, false );
+		MaliLazyRec *rec = nCodeBytes ? MaliLazyNewRec( false, GLMPixelShaderTranslatorOptions( m_ctx, pShaderName ), nShadowDepthSamplerMask, nCentroidMask, (const uint32 *)pFunction, nCodeBytes, pDebugLabel ) : NULL;
+		if ( rec )
+		{
+			m_ObjectStats.m_nTotalPixelShaders++;
+
+			IDirect3DPixelShader9 *newprog = new IDirect3DPixelShader9;
+
+			newprog->m_pixHighWater = 0;
+			newprog->m_pixSamplerMask = 0;
+			newprog->m_pixSamplerTypes = 0;
+			newprog->m_pixFragDataMask = 0;
+
+			newprog->m_pixProgram = MaliLazyNewProgram( m_ctx, kGLMFragmentProgram, pShaderName ? pShaderName : "?" );
+			newprog->m_pixProgram->m_nCentroidMask = nCentroidMask;
+			newprog->m_pixProgram->m_nShadowDepthSamplerMask = nShadowDepthSamplerMask;
+			newprog->m_pixProgram->m_bTranslatedProgram = true;
+			newprog->m_pixProgram->m_maxVertexAttrs = 0;
+
+			newprog->m_device = this;
+
+			MaliLazyInsert( rec, newprog->m_pixProgram, newprog );
+			MaliProf_Counter( kMaliCtrLazyCreated );
+
+			*ppShader = newprog;
+			return S_OK;
+		}
+	}
+
+
 	{
 		int numTranslations = 1;
 		
@@ -3891,25 +4443,12 @@ HRESULT IDirect3DDevice9::CreatePixelShader(CONST DWORD* pFunction,IDirect3DPixe
 		// note the GLSL translator wants its own buffer
 		tempbuf.EnsureCapacity( maxTranslationSize );
 			
-		uint glslPixelShaderOptions = D3DToGL_OptionUseEnvParams;// | D3DToGL_OptionAllowStaticControlFlow;
-			
+		uint glslPixelShaderOptions = GLMPixelShaderTranslatorOptions( m_ctx, pShaderName );
 
-		// Fake SRGB mode - needed on R500, probably indefinitely.
-		// Do this stuff if caps show m_needsFakeSRGB=true and the sRGBWrite state is true
-		// (but not if it's engine_post which is special)
-
-		if (!m_ctx->Caps().m_hasGammaWrites)
 		{
-			if ( pShaderName )
-			{
-				if ( !V_stristr( pShaderName, "engine_post" ) )
-				{
-					glslPixelShaderOptions |= D3DToGL_OptionSRGBWriteSuffix;
-				}
-			}
+			CMaliProfScope profXlat( kMaliProfXlat, pShaderName );	// time spent in the translator (hitch profiler, mali_opt.h)
+			g_D3DToOpenGLTranslatorGLSL.TranslateShader( (uint32 *) pFunction, &tempbuf, &bVertexShader, glslPixelShaderOptions, nShadowDepthSamplerMask, nCentroidMask, pDebugLabel );
 		}
-
-		g_D3DToOpenGLTranslatorGLSL.TranslateShader( (uint32 *) pFunction, &tempbuf, &bVertexShader, glslPixelShaderOptions, nShadowDepthSamplerMask, nCentroidMask, pDebugLabel );
 			
 		transbuf.PutString( (char*)tempbuf.Base() );
 		transbuf.PutString( "\n\n" );	// whitespace
@@ -3940,125 +4479,8 @@ HRESULT IDirect3DDevice9::CreatePixelShader(CONST DWORD* pFunction,IDirect3DPixe
 			newprog->m_device = this;
 			
 			//------ find the frag program metadata and extract it..
-						
-			
-			{
-				// find the highwater mark
-				char *highWaterPrefix = "//HIGHWATER-";		// try to arrange this so it can work with pure GLSL if needed
-				char *highWaterStr = strstr( (char *)transbuf.Base(), highWaterPrefix );
-				if (highWaterStr)
-				{
-					char *highWaterActualData = highWaterStr + strlen( highWaterPrefix );
-				
-					int value = -1;
-					sscanf( highWaterActualData, "%d", &value );
+			GLMReadPixelShaderMeta( newprog, (char *)transbuf.Base() );
 
-					newprog->m_pixHighWater = value;
-					newprog->m_pixProgram->m_descs[kGLMGLSL].m_highWater = value;
-				}
-				else
-				{
-					Assert(!"couldn't find sampler map in pixel shader");
-				}
-			}
-
-			{
-				// find the sampler map
-				char *samplerMaskPrefix = "//SAMPLERMASK-";		// try to arrange this so it can work with pure GLSL if needed
-			
-				char *samplerMaskStr = strstr( (char *)transbuf.Base(), samplerMaskPrefix );
-				if (samplerMaskStr)
-				{
-					char *samplerMaskActualData = samplerMaskStr + strlen( samplerMaskPrefix );
-				
-					int value = -1;
-					sscanf( samplerMaskActualData, "%04x", &value );
-
-					newprog->m_pixSamplerMask = value;
-					newprog->m_pixProgram->m_samplerMask = value;	// helps GLM maintain a better linked pair cache even when SRGB sampler state changes
-										
-					int nMaxReg;
-					for ( nMaxReg = 31; nMaxReg >= 0; --nMaxReg )
-						if ( value & ( 1 << nMaxReg ) )
-							break;
-
-					newprog->m_pixProgram->m_maxSamplers = nMaxReg + 1;
-
-					int nNumUsedSamplers = 0;
-					for ( int i = 31; i >= 0; --i)
-						if ( value & ( 1 << i ) )
-							nNumUsedSamplers++;
-					newprog->m_pixProgram->m_nNumUsedSamplers = nNumUsedSamplers;
-				}
-				else
-				{
-					Assert(!"couldn't find sampler map in pixel shader");
-				}
-			}
-
-			{
-				// find the sampler map
-				char *samplerTypesPrefix = "//SAMPLERTYPES-";		// try to arrange this so it can work with pure GLSL if needed
-
-				char *samplerTypesStr = strstr( (char *)transbuf.Base(), samplerTypesPrefix );
-				if (samplerTypesStr)
-				{
-					char *samplerTypesActualData = samplerTypesStr + strlen( samplerTypesPrefix );
-
-					int value = -1;
-					sscanf( samplerTypesActualData, "%08x", &value );
-
-					newprog->m_pixSamplerTypes = value;
-					newprog->m_pixProgram->m_samplerTypes = value;	// helps GLM maintain a better linked pair cache even when SRGB sampler state changes
-				}
-				else
-				{
-					Assert(!"couldn't find sampler types in pixel shader");
-				}
-			}
-
-			{
-				// find the fb outputs used by this shader/combo
-				const GLenum buffers[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3 };
-
-				char *fragDataMaskPrefix = "//FRAGDATAMASK-";		
-
-				char *fragDataMaskStr = strstr( (char *)transbuf.Base(), fragDataMaskPrefix );
-				if ( fragDataMaskStr )
-				{
-					char *fragDataActualData = fragDataMaskStr + strlen( fragDataMaskPrefix );
-
-					int value = -1;
-					sscanf( fragDataActualData, "%04x", &value );
-
-					newprog->m_pixFragDataMask = value;
-					newprog->m_pixProgram->m_fragDataMask = value;
-
-					newprog->m_pixProgram->m_numDrawBuffers = 0;
-					for( int i = 0; i < 4; i++ )
-					{
-						if( newprog->m_pixProgram->m_fragDataMask & ( 1 << i ) )
-						{
-							newprog->m_pixProgram->m_drawBuffers[ newprog->m_pixProgram->m_numDrawBuffers ] = buffers[ i ];
-							newprog->m_pixProgram->m_numDrawBuffers++;
-						}
-					}
-
-					if( newprog->m_pixProgram->m_numDrawBuffers ==  0 )
-					{
-						Assert(!"couldn't find fragment output in pixel shader");
-						newprog->m_pixProgram->m_drawBuffers[ 0 ] = buffers[ 0 ];
-						newprog->m_pixProgram->m_numDrawBuffers = 1;
-					}
-				}
-				else
-				{
-					newprog->m_pixFragDataMask = 0;
-					newprog->m_pixProgram->m_fragDataMask = 0;
-				}
-
-			}
-									
 			*ppShader = newprog;
 			
 			result = S_OK;
@@ -4081,6 +4503,10 @@ IDirect3DPixelShader9::~IDirect3DPixelShader9()
 
 		if (m_pixProgram)
 		{
+			// a shader that was never translated (mali_opt.h) still has its byte code on file
+			if ( MaliLazy_IsPendingText( m_pixProgram->m_text ) )
+				MaliLazy_ForgetProgram( m_pixProgram );
+
 			m_pixProgram->m_ctx->DelProgram( m_pixProgram );
 			m_pixProgram = NULL;
 		}
@@ -4152,6 +4578,38 @@ HRESULT IDirect3DDevice9::CreateVertexShader(CONST DWORD* pFunction, IDirect3DVe
 	*ppShader = NULL;
 
 	uint32 nCentroidMask = CentroidMaskFromName( false, pShaderName );
+
+	// Lazy translation (mali_opt.h): keep a copy of the byte code and translate the shader when a draw first needs it. Anything that
+	// does not look like a shader model 2 / 3 vertex shader, or an allocation that fails, takes the normal path below.
+	if ( GLMLazyTranslationAllowed() )
+	{
+		const size_t nCodeBytes = MaliOpt_D3DBytecodeBytes( (const uint32_t *)pFunction, true );
+		MaliLazyRec *rec = nCodeBytes ? MaliLazyNewRec( true, GLMVertexShaderTranslatorOptions( m_ctx ), -1, nCentroidMask, (const uint32 *)pFunction, nCodeBytes, pDebugLabel ) : NULL;
+		if ( rec )
+		{
+			m_ObjectStats.m_nTotalVertexShaders++;
+
+			IDirect3DVertexShader9 *newprog = new IDirect3DVertexShader9;
+
+			newprog->m_device = this;
+			newprog->m_vtxHighWater = 0;
+			newprog->m_vtxHighWaterBone = 0;
+			memset( newprog->m_vtxAttribMap, 0xBB, sizeof( newprog->m_vtxAttribMap ) );
+			newprog->m_maxVertexAttrs = 0;
+
+			newprog->m_vtxProgram = MaliLazyNewProgram( m_ctx, kGLMVertexProgram, pShaderName ? pShaderName : "?" );
+			newprog->m_vtxProgram->m_nCentroidMask = nCentroidMask;
+			newprog->m_vtxProgram->m_bTranslatedProgram = true;
+			newprog->m_vtxProgram->m_maxVertexAttrs = 0;
+
+			MaliLazyInsert( rec, newprog->m_vtxProgram, newprog );
+			MaliProf_Counter( kMaliCtrLazyCreated );
+
+			*ppShader = newprog;
+			return S_OK;
+		}
+	}
+
 			
 	{
 		int numTranslations = 1;
@@ -4169,29 +4627,12 @@ HRESULT IDirect3DDevice9::CreateVertexShader(CONST DWORD* pFunction, IDirect3DVe
 		// note the GLSL translator wants its own buffer
 		tempbuf.EnsureCapacity( maxTranslationSize );
 			
-		uint glslVertexShaderOptions = D3DToGL_OptionUseEnvParams | D3DToGL_OptionDoFixupZ | D3DToGL_OptionDoFixupY;
+		uint glslVertexShaderOptions = GLMVertexShaderTranslatorOptions( m_ctx );
 
-		if ( m_ctx->Caps().m_hasNativeClipVertexMode )
 		{
-			// note the matched trickery over in IDirect3DDevice9::FlushStates - 
-			// if on a chipset that does no have native gl_ClipVertex support, then
-			// omit writes to gl_ClipVertex, and instead submit plane equations that have been altered,
-			// and clipping will take place in GL space using gl_Position instead of gl_ClipVertex.
-				
-			// note that this is very much a hack to mate up with ATI R5xx hardware constraints, and with older
-			// drivers even for later ATI parts like r6xx/r7xx.   And it doesn't work on NV parts, so you really
-			// do have to choose the right way to go.
-				
-			glslVertexShaderOptions |= D3DToGL_OptionDoUserClipPlanes; 
+			CMaliProfScope profXlat( kMaliProfXlat, pShaderName );	// time spent in the translator (hitch profiler, mali_opt.h)
+			g_D3DToOpenGLTranslatorGLSL.TranslateShader( (uint32 *) pFunction, &tempbuf, &bVertexShader, glslVertexShaderOptions, -1, nCentroidMask, pDebugLabel );
 		}
-			
-		if ( !CommandLine()->CheckParm("-disableboneuniformbuffers") )
-		{
-			// If using GLSL, enabling a uniform buffer specifically for bone registers. (Not currently supported with ARB shaders, which are not optimized at all anyway.)
-			glslVertexShaderOptions |= D3DToGL_OptionGenerateBoneUniformBuffer;
-		}
-
-		g_D3DToOpenGLTranslatorGLSL.TranslateShader( (uint32 *) pFunction, &tempbuf, &bVertexShader, glslVertexShaderOptions, -1, nCentroidMask, pDebugLabel );
 			
 		transbuf.PutString( (char*)tempbuf.Base() );
 		transbuf.PutString( "\n\n" );	// whitespace
@@ -4217,91 +4658,8 @@ HRESULT IDirect3DDevice9::CreateVertexShader(CONST DWORD* pFunction, IDirect3DVe
 			newprog->m_vtxProgram->m_maxVertexAttrs = 0;
 			newprog->m_maxVertexAttrs = 0;
 						
-			// find the highwater mark..
-						
-			char *highWaterPrefix = "//HIGHWATER-";		// try to arrange this so it can work with pure GLSL if needed
-			char *highWaterStr = strstr( (char *)transbuf.Base(), highWaterPrefix );
-			if (highWaterStr)
-			{
-				char *highWaterActualData = highWaterStr + strlen( highWaterPrefix );
-				
-				int value = -1;
-				sscanf( highWaterActualData, "%d", &value );
+			GLMReadVertexShaderMeta( newprog, (char *)transbuf.Base() );
 
-				newprog->m_vtxHighWater = value;
-				newprog->m_vtxProgram->m_descs[kGLMGLSL].m_highWater = value;
-			}
-			else
-			{
-				Assert(!"couldn't find highwater mark in vertex shader");
-			}
-
-			char *highWaterBonePrefix = "//HIGHWATERBONE-";		// try to arrange this so it can work with pure GLSL if needed
-			char *highWaterBoneStr = strstr( (char *)transbuf.Base(), highWaterBonePrefix );
-			if (highWaterBoneStr)
-			{
-				char *highWaterActualData = highWaterBoneStr + strlen( highWaterBonePrefix );
-
-				int value = -1;
-				sscanf( highWaterActualData, "%d", &value );
-
-				newprog->m_vtxHighWaterBone = value;
-				newprog->m_vtxProgram->m_descs[kGLMGLSL].m_VSHighWaterBone = value;
-			}
-			else
-			{
-				newprog->m_vtxHighWaterBone = 0;
-				newprog->m_vtxProgram->m_descs[kGLMGLSL].m_VSHighWaterBone = 0;
-			}
-									
-			// find the attrib map..
-			char *attribMapPrefix = "//ATTRIBMAP-";		// try to arrange this so it can work with pure GLSL if needed
-			char *attribMapStr = strstr( (char *)transbuf.Base(), attribMapPrefix );
-			
-			if (attribMapStr)
-			{
-				char *attribMapActualData = attribMapStr + strlen( attribMapPrefix );
-				uint nMaxVertexAttribs = 0;
-				for( int i=0; i<16; i++)
-				{
-					int value = -1;
-					char *dataItem = attribMapActualData + (i*3);
-					sscanf( dataItem, "%02x", &value );
-					if (value >=0)
-					{
-						// make sure it's not a terminator
-						if (value == 0xBB)
-						{
-							DXABSTRACT_BREAK_ON_ERROR();
-						}
-					}
-					else
-					{
-						// probably an 'xx'... check
-						if ( (dataItem[0] != 'x') || (dataItem[1] != 'x') )
-						{
-							DXABSTRACT_BREAK_ON_ERROR();	// bad news
-						}
-						else
-						{
-							value = 0xBB;		// not likely to see one of these... "fog with usage index 11"
-						}
-					}
-
-					if ( value != 0xBB )
-						nMaxVertexAttribs = i;
-
-					newprog->m_vtxAttribMap[i] = value;
-				}
-
-				newprog->m_vtxProgram->m_maxVertexAttrs = nMaxVertexAttribs + 1;
-				newprog->m_maxVertexAttrs = nMaxVertexAttribs + 1;
-			}
-			else
-			{
-				DXABSTRACT_BREAK_ON_ERROR();	// that's bad...
-			}
-									
 			*ppShader = newprog;
 			
 			result = S_OK;
@@ -4323,6 +4681,10 @@ IDirect3DVertexShader9::~IDirect3DVertexShader9()
 
 		if (m_vtxProgram)
 		{
+			// a shader that was never translated (mali_opt.h) still has its byte code on file
+			if ( MaliLazy_IsPendingText( m_vtxProgram->m_text ) )
+				MaliLazy_ForgetProgram( m_vtxProgram );
+
 			m_vtxProgram->m_ctx->DelProgram( m_vtxProgram );
 			m_vtxProgram = NULL;
 		}
@@ -5503,6 +5865,11 @@ HRESULT IDirect3DDevice9::FlushVertexBindings( uint baseVertexIndex )
 	// push vertex buffer state for the current vertex decl
 	// in this variant we just walk the attrib map in the VS and do a pull for each one.
 	// if we can't find a match in the vertex decl, we may fall back to the secret 'dummy' VBO that GLM maintains
+
+	// The attribute map of a vertex shader that is translated on first use (mali_opt.h) only exists once it is translated, and this runs before
+	// GLMContext::FlushDrawStates() gets to do that.
+	if ( MaliLazy_IsPendingText( m_vertexShader->m_vtxProgram->m_text ) )
+		MaliLazy_EnsureProgram( m_vertexShader->m_vtxProgram );
 
 	GLMVertexSetup	setup;
 	memset( &setup, 0, sizeof( setup ) );
