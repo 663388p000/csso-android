@@ -1863,6 +1863,9 @@ void GLMContext::LinkShaderPair( CGLMProgram *vp, CGLMProgram *fp )
 {
 	if ( (m_pairCache) && (m_drawingLang==kGLMGLSL) && (vp) && (fp) )
 	{
+		MaliLazy_EnsureProgram( vp );	// shaders that are translated on first use (mali_opt.h) are, now that the engine wants the pair linked
+		MaliLazy_EnsureProgram( fp );
+
 		CGLMShaderPair	*pair = m_pairCache->SelectShaderPair( vp, fp, 0 );
 		(void)pair;
 		
@@ -1876,6 +1879,9 @@ void GLMContext::ValidateShaderPair( CGLMProgram *vp, CGLMProgram *fp )
 {
 	if ((m_pairCache) && (m_drawingLang == kGLMGLSL) && (vp) && (fp))
 	{
+		MaliLazy_EnsureProgram( vp );	// see LinkShaderPair()
+		MaliLazy_EnsureProgram( fp );
+
 		CGLMShaderPair	*pair = m_pairCache->SelectShaderPair( vp, fp, 0 );
 		Assert( pair != NULL );
 		pair->ValidateProgramPair();
@@ -2343,7 +2349,10 @@ void GLMContext::Present( CGLMTex *tex )
 				// showparams.m_noBlit is left set to 0.  CocoaMgr does the blit.
 			}
 
-			ShowPixels(&showparams);
+			{
+				CMaliProfScope profSwap( kMaliProfSwap );	// the buffer swap: with vsync on this is where a frame waits (hitch profiler, mali_opt.h)
+				ShowPixels(&showparams);
+			}
 		}
 
 		//	put the original FB back in place (both read and draw)
@@ -2357,6 +2366,8 @@ void GLMContext::Present( CGLMTex *tex )
 	}
 
 	m_nCurFrame++;
+
+	MaliProf_FrameEnd();	// hitch profiler: this frame is over (mali_opt.h)
 
 #if GL_BATCH_PERF_ANALYSIS
 	tmMessage( TELEMETRY_LEVEL2, TMMF_ICON_EXCLAMATION, "VS Uniform Calls: %u, VS Uniforms: %u|VS Uniform Bone Calls: %u, VS Bone Uniforms: %u|PS Uniform Calls: %u, PS Uniforms: %u", m_nTotalVSUniformCalls, m_nTotalVSUniformsSet, m_nTotalVSUniformBoneCalls, m_nTotalVSUniformsBoneSet, m_nTotalPSUniformCalls, m_nTotalPSUniformsSet );
