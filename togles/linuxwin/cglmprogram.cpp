@@ -89,6 +89,8 @@ GLenum	GLMProgTypeToARBEnum( EGLMProgramType type )
 	return result;
 }
 
+typedef char MaliCheckGLintIsInt[ sizeof( GLint ) == sizeof( int ) ? 1 : -1 ];		// m_UniformBufferParams is filled through an int pointer (MaliOpt_UniformArrayLocations)
+
 GLenum	GLMProgTypeToGLSLEnum( EGLMProgramType type )
 {
 	GLenum	result = 0;
@@ -130,7 +132,9 @@ CGLMProgram::CGLMProgram( GLMContext *ctx, EGLMProgramType type )
 	GLMShaderDesc *glslDesc = &m_descs[ kGLMGLSL ];
 	GLenum glslStage = GLMProgTypeToGLSLEnum( m_type );
 
-	glslDesc->m_object.glsl = gGL->glCreateShader( glslStage );;
+	// A lazily translated shader (mali_opt.h) gets its GL shader object when it is translated: most of them never are.
+	if ( !MaliLazy_DeferShaderObject() )
+		glslDesc->m_object.glsl = gGL->glCreateShader( glslStage );
 
 	m_shaderName[0] = '\0';
 
@@ -291,6 +295,18 @@ void	CGLMProgram::SetProgramText( char *text )
 	}
 }
 
+// Finishes a lazily translated program (see MaliLazy_EnsureProgram in dxabstract.cpp): the translated text replaces the placeholder,
+// the GL shader object that was left out is created, and the shader is compiled the same way GLMContext::NewProgram() does.
+void MaliLazy_FinishProgram( CGLMProgram *pProg, char *pText )
+{
+	GLMShaderDesc *glslDesc = &pProg->m_descs[ kGLMGLSL ];
+	if ( !glslDesc->m_object.glsl )
+		glslDesc->m_object.glsl = gGL->glCreateShader( GLMProgTypeToGLSLEnum( pProg->m_type ) );
+
+	pProg->SetProgramText( pText );
+	pProg->CompileActiveSources();
+}
+
 void	CGLMProgram::CompileActiveSources	( void )
 {
 	// compile everything we have text for
@@ -336,6 +352,8 @@ void	CGLMProgram::Compile( EGLMProgramLang lang )
 				return;						// (the compile statistics below only count real compiles)
 			}
 
+			const uint64_t nProfStart = g_nMaliProfOn ? MaliProf_NowUs() : 0;		// hitch profiler: only real compiles are timed
+
 			// no GLSL program either
 			// (a postponed compile runs while a pair is being linked and must not change which program is bound)
 			if ( !s_bCompileShaderNow )
@@ -374,6 +392,9 @@ void	CGLMProgram::Compile( EGLMProgramLang lang )
 
 			GLint isCompiled = 0;
 			gGL->glGetShaderiv(glslDesc->m_object.glsl, GL_COMPILE_STATUS, &isCompiled);
+
+			if ( nProfStart )
+				MaliProf_Add( kMaliProfCompile, MaliProf_NowUs() - nProfStart, m_shaderName );
 
 			if(isCompiled == GL_FALSE)
 			{
@@ -767,6 +788,7 @@ bool CGLMShaderPair::ValidateProgramPair()
 	
 	if ( !m_valid && m_bCheckLinkStatus )
 	{
+		const uint64_t nProfStart = g_nMaliProfOn ? MaliProf_NowUs() : 0;		// hitch profiler: link status + uniform lookups (the shader compiles above have their own timer)
 		bool bTimeShaderCompiles = (CommandLine()->FindParm( "-gl_time_shader_compiles" ) != 0);
 		// If using "-gl_time_shader_compiles", keeps track of total cycle count spent on shader compiles.
 		CFastTimer shaderCompileTimer;
@@ -866,18 +888,11 @@ bool CGLMShaderPair::ValidateProgramPair()
 
 				const uint nNum = (i == kGLMVertexProgram) ? m_vertexProg->m_descs[kGLMGLSL].m_highWater : m_fragmentProg->m_descs[kGLMGLSL].m_highWater;
 
-				uint j;
-				for (j = 0; j < nNum; j++)
-				{
-					char buf[256];
-					V_snprintf( buf, sizeof(buf), "%cc[%i]", "vp"[i], j );
-					// Grab the handle of each array element, so we can more efficiently update array elements in the middle.
-					int l = m_UniformBufferParams[i][j] = gGL->glGetUniformLocation( m_program, buf );
-					if (l < 0)
-						break;
-				}
-
-				m_NumUniformBufferParams[i] = j;
+				// Grab the handle of each array element, so we can more efficiently update array elements in the middle.
+				// The elements of a uniform array have consecutive locations on the Mali driver: MaliOpt_UniformArrayLocations() asks for the
+				// first one, checks a few more and computes the rest (it falls back to asking for every element, with the same result).
+				const uint nMaxElems = (uint)ARRAYSIZE( m_UniformBufferParams[i] );
+				m_NumUniformBufferParams[i] = MaliOpt_UniformArrayLocations( m_program, "vp"[i], (int)( nNum < nMaxElems ? nNum : nMaxElems ), (int *)m_UniformBufferParams[i] );
 			}
 
 			m_locFragmentFakeSRGBEnable = gGL->glGetUniformLocation( m_program, "flSRGBWrite" );
@@ -922,6 +937,9 @@ bool CGLMShaderPair::ValidateProgramPair()
 			shaderCompileTimer.End();
 			gShaderLinkQueryTime += shaderCompileTimer.GetDuration();
 		}
+
+		if ( nProfStart )
+			MaliProf_Add( kMaliProfValidate, MaliProf_NowUs() - nProfStart, m_vertexProg ? m_vertexProg->m_shaderName : NULL, m_fragmentProg ? m_fragmentProg->m_shaderName : NULL );
 	}
 	
 	return m_valid;
@@ -938,6 +956,15 @@ bool CGLMShaderPair::SetProgramPair( CGLMProgram *vp, CGLMProgram *fp )
 		shaderCompileTimer.Start();
 	}
 	
+	// Lazily translated shaders (mali_opt.h) are translated by FlushDrawStates() before a pair is made; this catches every other way in.
+	if ( vp && MaliLazy_IsPendingText( vp->m_text ) )
+		MaliLazy_EnsureProgram( vp );
+	if ( fp && MaliLazy_IsPendingText( fp->m_text ) )
+		MaliLazy_EnsureProgram( fp );
+
+	const uint64_t nProfStart = g_nMaliProfOn ? MaliProf_NowUs() : 0;		// hitch profiler
+	const char *pProfNote = "";
+
 	m_valid	= false;			// assume failure
 	
 	// No need to check that vp and fp are valid at this point (ie shader compile succeed)
@@ -1038,6 +1065,8 @@ bool CGLMShaderPair::SetProgramPair( CGLMProgram *vp, CGLMProgram *fp )
 			gGL->glLinkProgram( m_program );
 		}
 
+		pProfNote = bRestored ? "(restored from the program cache)" : ( bProgCache ? "(not in the program cache: compiled and linked)" : "(compiled and linked)" );
+
 		GLint isLinked = 0;
 		gGL->glGetProgramiv(m_program, GL_LINK_STATUS, &isLinked);
 		if(isLinked == GL_FALSE)
@@ -1081,6 +1110,9 @@ bool CGLMShaderPair::SetProgramPair( CGLMProgram *vp, CGLMProgram *fp )
 		gShaderLinkTime += shaderCompileTimer.GetDuration();
 		gShaderLinkCount++;
 	}
+
+	if ( nProfStart )
+		MaliProf_Add( kMaliProfLink, MaliProf_NowUs() - nProfStart, vp ? vp->m_shaderName : NULL, fp ? fp->m_shaderName : NULL, pProfNote );
 
 	return m_valid;
 }
