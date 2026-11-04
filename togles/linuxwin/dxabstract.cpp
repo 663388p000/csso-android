@@ -117,7 +117,7 @@ inline void GetStackCrawl( CStackCrawlParams *params )
 
 bool D3DMATRIX::operator == ( CONST D3DMATRIX& src) const 
 {
-	return V_memcmp( (void*)this, (void*)&src, sizeof(this) ) == 0;
+	return V_memcmp( (void*)this, (void*)&src, sizeof(*this) ) == 0;
 }
 
 D3DMATRIX::operator void* ()
@@ -161,7 +161,7 @@ const float& D3DXMATRIX::operator()( int row, int column ) const
 
 bool D3DXMATRIX::operator != ( CONST D3DXMATRIX& src ) const 
 {
-	return V_memcmp( (void*)this, (void*)&src, sizeof(this) ) != 0;
+	return V_memcmp( (void*)this, (void*)&src, sizeof(*this) ) != 0;
 }
 
 // ------------------------------------------------------------------------------------------------------------------------------ //
@@ -7080,7 +7080,7 @@ D3DXMATRIX* D3DXMatrixTranspose( D3DXMATRIX *pOut, CONST D3DXMATRIX *pM )
 		D3DXMatrixTranspose( pOut, &temp );
 	}
 
-	return NULL;
+	return pOut;	// like D3DX: the output matrix, so the call can be used as an argument of another one
 }
 
 
@@ -7158,7 +7158,9 @@ D3DXMATRIX* D3DXMatrixPerspectiveOffCenterRH( D3DXMATRIX *pOut, FLOAT l, FLOAT r
 
 D3DXPLANE* D3DXPlaneTransform( D3DXPLANE *pOut, CONST D3DXPLANE *pP, CONST D3DXMATRIX *pM )
 {
-	float *out = &pOut->a;
+	// Computed into a local first: D3DX allows pOut == pP (an in-place transform), and writing the output's a, b, c, d while the
+	// loop still reads them from the input would corrupt every component after the first.
+	float out[4];
 
 	// dot dot dot
 	for( int x=0; x<4; x++ )
@@ -7168,7 +7170,9 @@ D3DXPLANE* D3DXPlaneTransform( D3DXPLANE *pOut, CONST D3DXPLANE *pP, CONST D3DXM
 				+	(pM->m[2][x] * pP->c)
 				+	(pM->m[3][x] * pP->d);
 	}
-	
+
+	pOut->a = out[0];	pOut->b = out[1];	pOut->c = out[2];	pOut->d = out[3];
+
 	return pOut;
 }
 
