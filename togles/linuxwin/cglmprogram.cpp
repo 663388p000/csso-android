@@ -1260,6 +1260,31 @@ static void WriteToProgramCache( CGLMShaderPair *pair )
 	pProgramCache->deleteThis();
 }
 
+// Index of the oldest (smallest m_lastMark) occupied entry of a hash row, -1 when the row has no occupied entry.
+// CGLMShaderPairCache::HashRowProbe() (cglmprogram.h) is supposed to report it, but it starts its search with
+// "long long oldestmark = 0xFFFFFFFFFFFFFFFFLL", which is -1 as a signed long long: no mark (they start at 1) is below that, so a full
+// row reports oldestway == -1 and the eviction would work on the entry in front of the row - the last way of the previous row, or
+// the memory in front of the whole table for row 0 - freeing a pair that belongs to another row and filing the new pair in the wrong row,
+// where no lookup finds it again. Scanning the row here does not depend on the header.
+static int GLMPairCacheOldestWay( const CGLMPairCacheEntry *row, uint ways )
+{
+	int oldestWay = -1;
+	long long oldestMark = 0;
+
+	for ( uint way = 0; way < ways; ++way )
+	{
+		const long long mark = row[way].m_lastMark;
+
+		if ( ( mark != 0 ) && ( ( oldestWay < 0 ) || ( mark < oldestMark ) ) )		// a mark of zero means an empty entry
+		{
+			oldestWay = (int)way;
+			oldestMark = mark;
+		}
+	}
+
+	return oldestWay;
+}
+
 // Calls glUseProgram() as a side effect
 CGLMShaderPair	*CGLMShaderPairCache::SelectShaderPairInternal( CGLMProgram *vp, CGLMProgram *fp, uint extraKeyBits, int rowIndex )
 {
@@ -1285,6 +1310,15 @@ CGLMShaderPair	*CGLMShaderPairCache::SelectShaderPairInternal( CGLMProgram *vp, 
 	int hitway, emptyway, oldestway;
 	HashRowProbe( row, vp, fp, extraKeyBits, hitway, emptyway, oldestway );
 	Assert( hitway == -1 );
+
+	// a row without a free way has to name the way that gets evicted (see GLMPairCacheOldestWay(): the probe's answer can be -1)
+	if ( ( emptyway < 0 ) && ( oldestway < 0 ) )
+	{
+		oldestway = GLMPairCacheOldestWay( row, m_ways );
+
+		if ( oldestway < 0 )
+			oldestway = 0;		// not reachable (a row without a free way has occupied entries), but never work on the memory in front of the row
+	}
 
 	// we missed.  if there is no empty way, then somebody's getting evicted.
 	int destway = -1;
