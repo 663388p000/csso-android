@@ -556,7 +556,7 @@ COpenGLEntryPoints::COpenGLEntryPoints()
 
 COpenGLEntryPoints::~COpenGLEntryPoints()
 {
-	for ( uint i = 0; i < cGLTotalDriverProviders; ++i )
+	for ( uint i = 0; i < cGLTotalDriverStrings; ++i )
 	{
 		free( m_pGLDriverStrings[i] );
 		m_pGLDriverStrings[i] = NULL;
