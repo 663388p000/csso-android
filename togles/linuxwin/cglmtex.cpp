@@ -36,6 +36,7 @@ extern "C" {
 #include "glmtexinlines.h"
 #include "astc_texcompress.h"
 #include "mali_opt.h"			// hitch profiler scopes and the ASTC decode mode
+#include "egl_opt.h"			// EGL layer: AHardwareBuffer storage for dynamic textures
 #include "arm_neon_opt.h"		// NEON texel padding / conversion (AArch64 only; scalar fallback otherwise)
 #include "tier0/dbg.h"		// Warning() / Msg() / Error() for the ASTC upload diagnostics		// added: ASTC LDR/HDR runtime recompression for ARGB/RGBA formats
 
@@ -1090,14 +1091,29 @@ CGLMTex::CGLMTex( GLMContext *ctx, GLMTexLayout *layout, uint levels, const char
 	m_SamplingParams.SetToDefaults();
 	m_SamplingParams.SetToTarget( m_texGLTarget );
 
+	// EGL layer (egl_opt.h): a dynamic 32 bit RGBA texture (font pages, UI atlases, procedural textures) lives in an
+	// AHardwareBuffer that is also the storage of the GL texture - Lock() hands out that memory, Unlock() has nothing left to
+	// copy or to encode. Only dynamic, single level, 2D, non render target A8R8G8B8 / X8R8G8B8 textures qualify; every other
+	// texture (all the static ones, with their ASTC path) is left alone. The texture is bound on the active TMU here.
+	bool bAhbTex = false;
+	{
+		const GLMTexLayoutKey &ahbKey = layout->m_key;
+		if ( ( ahbKey.m_texFlags & kGLMTexDynamic ) && !( ahbKey.m_texFlags & ( kGLMTexRenderable | kGLMTexMultisampled | kGLMTexMipped | kGLMTexMippedAuto ) ) &&
+			 ahbKey.m_texGLTarget == GL_TEXTURE_2D && m_layout->m_mipCount == 1 && m_layout->m_faceCount == 1 &&
+			 ( ahbKey.m_texFormat == D3DFMT_A8R8G8B8 || ahbKey.m_texFormat == D3DFMT_X8R8G8B8 ) )
+		{
+			bAhbTex = EglOpt_TexCreate( this, ahbKey.m_xSize, ahbKey.m_ySize, ahbKey.m_texFormat == D3DFMT_X8R8G8B8, ( ahbKey.m_texFlags & kGLMTexSRGB ) != 0 );
+		}
+	}
+
 	// the texture is bound on the active TMU: ask the sampler to decode ASTC to RGBA8 where the source is 8 bit anyway (Mali, mali_opt.h)
-	if ( GLMTexIsAstcManaged( m_layout ) && GLMTexAstcDecodesAs8Bit( m_layout ) )
+	if ( !bAhbTex && GLMTexIsAstcManaged( m_layout ) && GLMTexAstcDecodesAs8Bit( m_layout ) )
 		MaliOpt_AstcDecodeRGBA8( m_texGLTarget );
 	
 	// OK, our texture now exists and is bound on the active TMU.  Not drawable yet though.
 		
 	// Create backing storage and fill it
-	if ( !(layout->m_key.m_texFlags & kGLMTexRenderable) && m_texClientStorage )
+	if ( !bAhbTex && !(layout->m_key.m_texFlags & kGLMTexRenderable) && m_texClientStorage )
 	{
 		// ASTC-managed textures get a zero-filled shadow copy (their later partial updates merge into it)
 		m_backing = (char *)( GLMTexIsAstcManaged( m_layout ) ? calloc( 1, m_layout->m_storageTotalSize ) : malloc( m_layout->m_storageTotalSize ) );
@@ -1197,7 +1213,7 @@ CGLMTex::CGLMTex( GLMContext *ctx, GLMTexLayout *layout, uint levels, const char
 	#endif
 	
 	//if (pushRenderableSlices || pushTexSlices)
-	if ( !( ( layout->m_key.m_texFlags & kGLMTexMipped ) && ( levels == ( unsigned ) m_layout->m_mipCount ) ) )
+	if ( !bAhbTex && !( ( layout->m_key.m_texFlags & kGLMTexMipped ) && ( levels == ( unsigned ) m_layout->m_mipCount ) ) )
 	{
 		for( int face=0; face <m_layout->m_faceCount; face++)
 		{
@@ -1293,7 +1309,16 @@ CGLMTex::~CGLMTex( )
 	// if all that is OK, then delete the underlying tex
 	if ( m_texName )
 	{
-		m_ctx->DestroyTex( m_texGLTarget, m_layout, m_texName );
+		if ( EglOpt_TexTracked( this ) )
+		{
+			// EGL layer: the storage is an EGLImage / AHardwareBuffer. The name is deleted here and must not go back to the pool of reusable textures.
+			gGL->glDeleteTextures( 1, &m_texName );
+			EglOpt_TexDestroy( this );
+		}
+		else
+		{
+			m_ctx->DestroyTex( m_texGLTarget, m_layout, m_texName );
+		}
 		m_texName = 0;
 	}
 		
@@ -4268,6 +4293,36 @@ void CGLMTex::Lock( GLMTexLockParams *params, char** addressOut, int* yStrideOut
 		// illegal rect, out of bounds		
 		GLMStop();
 	}
+
+	// EGL layer (egl_opt.h): a dynamic texture that lives in an AHardwareBuffer is locked by handing out that very memory.
+	if ( EglOpt_TexTracked( this ) )
+	{
+		int nAhbPitch = 0;
+		char *pAhb = EglOpt_TexLock( this, params->m_readonly, &nAhbPitch );
+		if ( pAhb )
+		{
+			unsigned char *pAhbFlags = &m_sliceFlags[ sliceIndex ];
+			*pAhbFlags |= ( kSliceStorageValid | kSliceValid );
+			*pAhbFlags &= ~kSliceFullyDirty;
+
+			int nAhbDesc = m_ctx->m_texLocks.AddToTail();
+			GLMTexLockDesc *pAhbDesc = &m_ctx->m_texLocks[ nAhbDesc ];
+			pAhbDesc->m_req = *params;
+			pAhbDesc->m_active = true;
+			pAhbDesc->m_sliceIndex = sliceIndex;
+			pAhbDesc->m_sliceBaseOffset = slice->m_storageOffset;
+			pAhbDesc->m_sliceRegionOffset = 0;
+
+			// the rows of an AHardwareBuffer are padded: the caller must use the pitch we return, as it does for any D3D lock
+			*addressOut = pAhb + (size_t)params->m_region.ymin * (size_t)nAhbPitch + (size_t)params->m_region.xmin * 4;
+			*yStrideOut = nAhbPitch;
+			*zStrideOut = 0;
+			m_lockCount++;
+			return;
+		}
+		// The AHardwareBuffer could not be locked (not expected): fall through to the ordinary path below, which hands out a
+		// CPU block. Its contents are dropped at Unlock (the texture keeps what it had) but nothing crashes.
+	}
 	
 	// on return, these things need to be true
 
@@ -4493,6 +4548,15 @@ void CGLMTex::Unlock( GLMTexLockParams *params )
 				if (desc->m_active)
 				{
 					GLMStop();
+				}
+
+				// EGL layer (egl_opt.h): the texels already are in the memory the GPU samples (AHardwareBuffer) - nothing to
+				// encode or upload. The AHardwareBuffer is unlocked once the last lock is closed.
+				if ( EglOpt_TexTracked( this ) )
+				{
+					EglOpt_TexUnlock( this );
+					m_ctx->m_texLocks.FastRemove( j );	// remove from the pile, don't advance index
+					continue;
 				}
 				
 				// A partial lock means this texture is patched piecemeal (lightmap pages, decals, atlases): from now on
