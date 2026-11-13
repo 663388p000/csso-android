@@ -27,6 +27,7 @@
 //===============================================================================
 
 #include "togles/rendermechanism.h"
+#include "egl_opt.h"		// EGL layer: AHardwareBuffer storage for dynamic vertex / index buffers
 
 // memdbgon -must- be the last include file in a .cpp file.
 #include "tier0/memdbgon.h"
@@ -531,6 +532,22 @@ CGLMBuffer::CGLMBuffer( GLMContext *pCtx, EGLMBufferType type, uint size, uint o
 #endif
 		
 		m_pCtx->BindBufferToCtx( m_type, NULL );		// exit with no buffer bound
+
+#if !GL_ENABLE_UNLOCK_BUFFER_OVERWRITE_DETECTION
+		// EGL layer (egl_opt.h): a dynamic vertex / index buffer gets a ring of AHardwareBuffer backed GL buffers
+		// (EGL_ANDROID_get_native_client_buffer + GL_EXT_external_buffer), so the driver no longer copies client side arrays on
+		// every draw. The CPU copy made above stays as the fallback (m_pActualPseudoBuf); static buffers are never touched.
+		if ( m_bDynamic && ( m_type == kGLMVertexBuffer || m_type == kGLMIndexBuffer ) )
+		{
+			unsigned int nAhbName = 0;
+			if ( EglOpt_BufferCreate( this, m_buffGLTarget, m_nSize, m_pPseudoBuf, &nAhbName ) )
+			{
+				m_bPseudo = false;
+				m_nHandle = nAhbName;
+				m_pPseudoBuf = NULL;		// draws use the GL buffer now; m_pActualPseudoBuf keeps the CPU copy alive
+			}
+		}
+#endif
 	}
 	else
 	{
@@ -563,6 +580,15 @@ CGLMBuffer::CGLMBuffer( GLMContext *pCtx, EGLMBufferType type, uint size, uint o
 CGLMBuffer::~CGLMBuffer( )
 {
 	m_pCtx->CheckCurrent();
+
+	// EGL layer: drop the AHardwareBuffer slots; the CPU copy is then freed below like any other pseudo buffer
+	if ( m_bDynamic && EglOpt_BufferTracked( this ) )
+	{
+		m_pCtx->BindBufferToCtx( m_type, NULL );	// the slot buffers are deleted now: none of them may stay bound in the state cache
+		EglOpt_BufferDestroy( this );
+		m_bPseudo = true;
+		m_nHandle = 0;
+	}
 	
 	if ( m_bPseudo )
 	{
@@ -700,6 +726,37 @@ void CGLMBuffer::Lock( GLMBuffLockParams *pParams, char **pAddressOut )
 	m_pStaticBuffer = NULL;
 	bool bUsingPersistentBuffer = false;
 
+	// EGL layer (egl_opt.h): a dynamic vertex / index buffer with AHardwareBuffer storage. A DISCARD moves to the next ring slot
+	// the GPU has finished with; when none is free the buffer goes back to its CPU copy (the ordinary pseudo path below).
+	char *pAhbAddress = NULL;
+	if ( m_bDynamic && ( m_type == kGLMVertexBuffer || m_type == kGLMIndexBuffer ) && EglOpt_BufferTracked( this ) )
+	{
+		void *pAhbBase = NULL;
+		unsigned int nAhbName = 0;
+		const int nAhbMode = EglOpt_BufferLock( this, pParams->m_bDiscard, pParams->m_bNoOverwrite, pParams->m_nOffset, pParams->m_nSize, &pAhbBase, &nAhbName );
+		if ( nAhbMode == kEglOptBufAhb )
+		{
+			if ( m_bPseudo || m_nHandle != nAhbName )
+			{
+				m_bPseudo = false;
+				m_nHandle = nAhbName;
+				m_pPseudoBuf = NULL;
+				m_nRevision++;		// the draw code binds the new GL buffer / re-points the attributes on a new revision
+			}
+			pAhbAddress = (char *)pAhbBase;
+		}
+		else if ( nAhbMode == kEglOptBufPseudo )
+		{
+			if ( !m_bPseudo )
+			{
+				m_bPseudo = true;
+				m_nHandle = 0;
+				m_nRevision++;
+			}
+			m_pPseudoBuf = (char *)pAhbBase;		// continues below as an ordinary pseudo buffer
+		}
+	}
+
 	uint padding = 0;
 	if ( m_bDynamic && gGL->m_bHave_GL_EXT_buffer_storage )
 	{
@@ -714,7 +771,12 @@ void CGLMBuffer::Lock( GLMBuffLockParams *pParams, char **pAddressOut )
 		}
 	}
 	
-	if ( m_bPseudo )
+	if ( pAhbAddress )
+	{
+		// AHardwareBuffer slot: ordinary memory that the GPU reads, nothing to map
+		resultPtr = pAhbAddress + pParams->m_nOffset;
+	}
+	else if ( m_bPseudo )
 	{
 		if ( pParams->m_bDiscard )
 		{
@@ -1087,6 +1149,15 @@ void CGLMBuffer::Unlock( int nActualSize, const void *pActualData )
 		}
 
 		m_pStaticBuffer = NULL;
+	}
+	else if ( m_bDynamic && !m_bPseudo && EglOpt_BufferInAhbMode( this ) )
+	{
+		// AHardwareBuffer slot (egl_opt.h): the vertices are already in the memory the GPU reads
+		if ( pActualData )
+		{
+			memcpy( m_pLastMappedAddress, pActualData, nActualSize );
+		}
+		EglOpt_BufferUnlock( this );
 	}
 	else if ( m_bPseudo )
 	{
