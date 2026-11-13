@@ -38,6 +38,7 @@
 #include "convar.h"
 
 #include "mali_opt.h"
+#include "egl_opt.h"			// EGL layer: frame fence / timestamps / presentation time / AHardwareBuffer storage
 
 #include "glmgr_flush.inl"
 
@@ -2349,10 +2350,12 @@ void GLMContext::Present( CGLMTex *tex )
 				// showparams.m_noBlit is left set to 0.  CocoaMgr does the blit.
 			}
 
+			EglOpt_BeforeSwap();	// EGL layer: in-flight limit, recorder, timestamps, presentation time, frame fence (all optional, see egl_opt.h)
 			{
 				CMaliProfScope profSwap( kMaliProfSwap );	// the buffer swap: with vsync on this is where a frame waits (hitch profiler, mali_opt.h)
 				ShowPixels(&showparams);
 			}
+			EglOpt_AfterSwap();		// EGL layer: fence descriptor of the frame that was just swapped, timestamps of older frames
 		}
 
 		//	put the original FB back in place (both read and draw)
@@ -2504,6 +2507,7 @@ GLMContext::GLMContext( IDirect3DDevice9 *pDevice, GLMDisplayParams *params )
 #if defined( USE_SDL )
 	m_ctx = (SDL_GLContext)GetGLContextForWindow( params ? (void*)params->m_focusWindow : NULL );
 	MakeCurrent( true );
+	EglOpt_Init();	// EGL layer: the context is current, look at the EGL / GL extensions (no-op without EGL)
 #else
 #error
 #endif
