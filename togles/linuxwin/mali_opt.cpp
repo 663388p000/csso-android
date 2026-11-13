@@ -2182,3 +2182,9 @@ CON_COMMAND( gl_gpu_info, "Print the GPU identity Togles detected (VendorID / De
 	e = getenv( "TOGL_GPU_SUPPORTED" );
 	ConMsg( " TOGL_GPU_SUPPORTED=%s\n", e ? e : "(unset)" );
 }
+
+//-----------------------------------------------------------------------------
+// 10. EGL layer (native fence, frame timestamps, presentation time, front buffer, AHardwareBuffer storage for dynamic
+// buffers / textures, recorder). Kept in its own file; it is included here so the build script does not change.
+//-----------------------------------------------------------------------------
+#include "egl_opt_impl.inl"
