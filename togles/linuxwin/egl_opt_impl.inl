@@ -52,14 +52,14 @@
 // switches
 //-----------------------------------------------------------------------------
 static ConVar gl_egl_opt( "gl_egl_opt", "1", FCVAR_ARCHIVE, "Master switch of the EGL layer (fences, frame timestamps, presentation time, AHardwareBuffer storage). Needs a restart. -gl_no_egl_opt on the command line does the same." );
-static ConVar gl_egl_native_fence( "gl_egl_native_fence", "1", FCVAR_ARCHIVE, "Use EGL_ANDROID_native_fence_sync for the per frame GPU fence (0 = use a GL sync object instead)." );
+static ConVar gl_egl_native_fence( "gl_egl_native_fence", "0", FCVAR_ARCHIVE, "Use EGL_ANDROID_native_fence_sync for the per frame GPU fence (0 = use a GL sync object instead)." );
 static ConVar gl_egl_max_frames( "gl_egl_max_frames", "0", FCVAR_ARCHIVE, "Limit the number of frames the CPU may run ahead of the GPU (2 = lowest latency, 3 = same as the default queue, 0 = off). Uses the per frame fence." );
 static ConVar gl_egl_timestamps( "gl_egl_timestamps", "1", FCVAR_ARCHIVE, "Collect EGL_ANDROID_get_frame_timestamps (GPU time, display latency, missed refreshes). See gl_egl_stats." );
 static ConVar gl_egl_present_time( "gl_egl_present_time", "1", FCVAR_ARCHIVE, "With fps_max below the refresh rate and vsync off: present every frame at an evenly spaced time on the compositor grid (EGL_ANDROID_presentation_time)." );
 static ConVar gl_egl_front_buffer( "gl_egl_front_buffer", "0", FCVAR_ARCHIVE, "Experimental low latency single buffer mode (EGL_KHR_mutable_render_buffer + EGL_ANDROID_front_buffer_auto_refresh). Can tear." );
 static ConVar gl_egl_ahb_buffers( "gl_egl_ahb_buffers", "1", FCVAR_ARCHIVE, "Dynamic vertex / index buffers live in AHardwareBuffer memory shared with the GPU (needs GL_EXT_external_buffer). Needs a restart of the video system." );
 static ConVar gl_egl_ahb_buffer_min_kb( "gl_egl_ahb_buffer_min_kb", "16", FCVAR_ARCHIVE, "Smallest dynamic buffer (KB) that gets AHardwareBuffer storage." );
-static ConVar gl_egl_ahb_buffer_slots( "gl_egl_ahb_buffer_slots", "3", FCVAR_ARCHIVE, "AHardwareBuffer slots created up front per dynamic buffer (it can grow to 8 when the GPU is behind)." );
+static ConVar gl_egl_ahb_buffer_slots( "gl_egl_ahb_buffer_slots", "6", FCVAR_ARCHIVE, "AHardwareBuffer slots created up front per dynamic buffer (it can grow to 8 when the GPU is behind)." );
 static ConVar gl_egl_ahb_textures( "gl_egl_ahb_textures", "1", FCVAR_ARCHIVE, "Dynamic RGBA textures live in an AHardwareBuffer (no copy, no ASTC encode on every update). Needs a restart of the video system." );
 static ConVar gl_egl_ahb_tex_min( "gl_egl_ahb_tex_min", "16", FCVAR_ARCHIVE, "Smallest side (pixels) of a dynamic texture that gets AHardwareBuffer storage." );
 static ConVar gl_egl_ahb_tex_wait( "gl_egl_ahb_tex_wait", "0", FCVAR_ARCHIVE, "1 = a write lock on an AHardwareBuffer texture first waits until the previous frame has finished on the GPU (no visible tearing, may stall)." );
